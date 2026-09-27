@@ -24,7 +24,7 @@ func TestContributeMCPContextBundleUsesActiveAssignment(t *testing.T) {
 	s.deps = &Dependencies{Config: &config.Config{Agents: map[string]config.AgentConfig{"lane": {Standby: &config.StandbyConfig{Enabled: true, DailyCapPerContributor: 2}}}}}
 	s.contributeHub = NewContributeWSHub(s.logger, s)
 	s.contributeHub.connections["alice"] = &ContributorConnection{
-		currentTask:    &WSTaskAssign{TaskID: "task-1", Kind: "issue", Repo: "owner/repo", Number: 42, Title: "do work", Key: "owner/repo#42"},
+		currentTask:    &WSTaskAssign{TaskID: "task-1", Kind: "issue", Repo: "owner/repo", Number: 42, Title: "do work", Key: "owner/repo#42", FromFork: true, HeadRepo: "alice/repo", Held: true, HoldReason: "waiting on review"},
 		currentTaskGen: 9,
 		currentLabels:  []string{"kind/feature"},
 		taskAssignedAt: time.Now().Add(-time.Minute),
@@ -43,6 +43,12 @@ func TestContributeMCPContextBundleUsesActiveAssignment(t *testing.T) {
 	}
 	if env.Data.TaskContext == nil || env.Data.TaskContext.Assignment.TaskID != "task-1" || env.Data.TaskContext.Assignment.Repo != "owner/repo" {
 		t.Fatalf("assignment = %#v", env.Data.TaskContext)
+	}
+	if !env.Data.TaskContext.Assignment.FromFork || env.Data.TaskContext.Assignment.HeadRepo != "alice/repo" {
+		t.Fatalf("fork assignment fields = %#v", env.Data.TaskContext.Assignment)
+	}
+	if !env.Data.TaskContext.Assignment.Held || env.Data.TaskContext.Assignment.HoldReason != "waiting on review" {
+		t.Fatalf("hold assignment fields = %#v", env.Data.TaskContext.Assignment)
 	}
 	if got := env.Data.TaskContext.Policies.Standby; len(got) != 1 || got[0].Lane != "lane" || got[0].DailyCap != 2 {
 		t.Fatalf("standby policy = %#v", got)
