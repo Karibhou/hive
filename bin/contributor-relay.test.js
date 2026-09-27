@@ -245,6 +245,20 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
       }
       return '';
     }
+    // #9078: the bracketed-paste delivery. load-buffer carries the prompt on
+    // stdin (opts.input); it is recorded into `commands` with the text so a
+    // "did the prompt reach the pane" assertion reads the same for either
+    // transport. failNextLiteralSend fails the paste too — it models the tmux
+    // server dying under the send, whichever command was in flight.
+    if (bin === 'tmux' && (args[0] === 'load-buffer' || args[0] === 'paste-buffer' || args[0] === 'delete-buffer')) {
+      const input = opts && typeof opts.input === 'string' ? ` ${opts.input}` : '';
+      if (commands.length < MAX_RECORDED_COMMANDS) commands.push(`tmux ${args.join(' ')}${input}`);
+      if (failNextLiteralSend && args[0] === 'paste-buffer') {
+        failNextLiteralSend = false;
+        throw new Error('tmux: server exited unexpectedly');
+      }
+      return '';
+    }
     if (cliVersion instanceof Error) throw cliVersion;
     if (cliVersion === null) throw new Error('spawnSync ENOENT');
     return cliVersion;
@@ -342,6 +356,11 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
     try { return JSON.parse(fs.readFileSync(headlessStatusFile, 'utf8')); } catch (_) { return null; }
   };
   relay.__tmuxSends = () => commands.filter(c => /send-keys/.test(c));
+  // #9078: the bracketed-paste deliveries, in order — each the text handed to
+  // `tmux load-buffer` on stdin.
+  relay.__pasteDeliveries = () => execFileSyncCalls
+    .filter(c => c.bin === 'tmux' && c.args[0] === 'load-buffer')
+    .map(c => c.opts.input);
   relay.__execFileSyncCalls = execFileSyncCalls;
   // #7907: a verdict is judged on the capture that finds it unless a test
   // opts into the settle — the existing tick-by-tick tests hand the relay a
@@ -2779,8 +2798,8 @@ function assignTask(relay, taskId, number = 421) {
   }));
 }
 
-// assignTask, plus the two things a STATIC pane fixture cannot express by
-// itself (kubestellar/hive#5650).
+// assignTask, plus the three things a STATIC pane fixture cannot express by
+// itself (kubestellar/hive#5650, #9078).
 //
 //  1. The CLI is up, so the prompt was typed rather than queued. tmuxSendKeys()
 //     queues whenever cliReady is false, and progressTick() now refuses to judge
@@ -2792,12 +2811,20 @@ function assignTask(relay, taskId, number = 421) {
 //     a real pane cannot do that, because the agent's verdict is printed after
 //     it runs. Clearing the delivery baseline states what these fixtures mean:
 //     "this task started from a pane with no verdict of its own on it".
+//  3. The turn visibly started. For the same reason — one static pane for
+//     every capture — a codex fixture of a FINISHED turn never shows the
+//     relay a turn beginning after delivery, so confirmPromptSubmitted()
+//     honestly reports UNKNOWN and progressTick() would fail the task as
+//     never submitted (#9078). Resetting the ack states what the fixture
+//     means: "the prompt went in, and this is what the pane looked like
+//     afterwards".
 //
-// Tests that are ABOUT either of those conditions set them up themselves.
+// Tests that are ABOUT any of those conditions set them up themselves.
 function dispatchTask(relay, taskId, number) {
   relay.setCliReady(true);
   assignTask(relay, taskId, number);
   relay.setDeliveredVerdictBaseline(null);
+  relay.setPromptAck(relay.PROMPT_ACK_SENT);
 }
 
 // Drive the crash path directly: assign, then let the progress tick observe a
@@ -11681,7 +11708,8 @@ test('#6541 negative control: an authorization refusal still fails fast and stay
 //
 // Two halves, tested separately below:
 //   - delivery: confirm the prompt actually left the input widget, re-sending
-//     Enter while it has not;
+//     Enter while it has not (and, since #9078, that a turn visibly STARTED —
+//     see that section further down for the half #6717 left open);
 //   - reporting: never let chrome_idle complete a task when the prompt is
 //     still visibly unsubmitted AND the pane has not changed one byte since
 //     delivery. Both signals are required, which is what the last two tests in
@@ -11755,7 +11783,7 @@ test('#6717 confirmPromptSubmitted re-sends Enter while the prompt is stuck, and
   const relay = loadRelay({ backend: 'codex', paneText: UNSUBMITTED_PASTE_PANE });
   try {
     const before = relay.__tmuxSends().filter(c => /send-keys .* Enter$/.test(c)).length;
-    assert.strictEqual(relay.confirmPromptSubmitted(), false,
+    assert.strictEqual(relay.confirmPromptSubmitted(), relay.PROMPT_ACK_UNKNOWN,
       'a widget that never clears must be reported as NOT submitted, not assumed delivered');
     const after = relay.__tmuxSends().filter(c => /send-keys .* Enter$/.test(c)).length;
     assert.strictEqual(after - before, relay.PROMPT_SUBMIT_RETRIES,
@@ -11779,7 +11807,8 @@ test('#6717 confirmPromptSubmitted succeeds as soon as the widget clears', () =>
   armed = true;
   try {
     const before = relay.__tmuxSends().filter(c => /send-keys .* Enter$/.test(c)).length;
-    assert.strictEqual(relay.confirmPromptSubmitted(), true, 'a widget that clears is submitted');
+    assert.strictEqual(relay.confirmPromptSubmitted(), relay.PROMPT_ACK_STARTED,
+      'a widget that clears into a working row is a turn that started');
     const after = relay.__tmuxSends().filter(c => /send-keys .* Enter$/.test(c)).length;
     assert.strictEqual(after - before, 1,
       'the retry loop must stop at the first Enter that works, not spend the whole budget');
@@ -11793,7 +11822,7 @@ test('#6717 a backend with no known placeholder rendering is left exactly as it 
   const relay = loadRelay({ backend: 'goose', paneText: UNSUBMITTED_PASTE_PANE });
   try {
     const before = relay.__tmuxSends().filter(c => /send-keys .* Enter$/.test(c)).length;
-    assert.strictEqual(relay.confirmPromptSubmitted(), true,
+    assert.strictEqual(relay.confirmPromptSubmitted(), relay.PROMPT_ACK_SENT,
       'an unobserved backend reports "no evidence of a stuck prompt", which is the honest answer');
     const after = relay.__tmuxSends().filter(c => /send-keys .* Enter$/.test(c)).length;
     assert.strictEqual(after, before, 'and it must not send a single extra keystroke');
@@ -11863,8 +11892,12 @@ test('#6717 a placeholder still on a pane that has since produced output does no
       : UNSUBMITTED_PASTE_PANE),
   });
   try {
-    dispatchTask(relay, 'ct-6717-echoed-paste', 217);
-    assert.strictEqual(relay.getPromptSubmissionConfirmed(), false,
+    // Not dispatchTask(): that helper resets the ack for static fixtures, and
+    // this test is ABOUT the ack being unknown.
+    relay.setCliReady(true);
+    assignTask(relay, 'ct-6717-echoed-paste', 217);
+    relay.setDeliveredVerdictBaseline(null);
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_UNKNOWN,
       'precondition: this task\'s submit was never confirmed, so only the pane-change signal can save it');
     delivered = true;
     graceTicks(relay, () => relay.__crashTick());
@@ -11872,6 +11905,252 @@ test('#6717 a placeholder still on a pane that has since produced output does no
       'output after delivery proves the agent ran; an echoed placeholder must not fail it');
     assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 1,
       'and the task must still complete normally');
+  } finally { teardown(relay); }
+});
+
+// ---------------------------------------------------------------------------
+// #9078 — long codex prompts remain unsubmitted; delayed paste rendering
+// defeats delivery verification
+//
+// Four consecutive assignments logged "Task prompt sent to CLI" and, eight
+// minutes later, "pane went idle before codex produced any task output". codex
+// 0.157.1 had logged zero turn/start requests: a ~6.8 KB prompt typed as one
+// `send-keys -l` burst left the input widget showing its idle "› Ask Codex to
+// do anything" hint, the three Enters started nothing, and a truncated
+// "[Pasted Content 4096 chars]" placeholder surfaced only seconds later. The
+// #6717 check saw no placeholder at the moment it looked and called that
+// submitted. The same prompt handed over with `load-buffer` + `paste-buffer -p`
+// rendered "[Pasted Content 6868 chars]" at once and the Enter started a turn.
+//
+// Three halves:
+//   - transport: codex gets an explicit bracketed paste, exactly once, with
+//     the buffer cleaned up; every other backend keeps its literal burst;
+//   - acknowledgement: an idle hint after Enter is UNKNOWN, not submitted; a
+//     visible working row is STARTED; the wait is bounded;
+//   - recovery: an UNKNOWN delivery whose pane has not moved by the next tick
+//     is failed on THAT tick — not after the chrome-idle grace — and is never
+//     re-pasted or re-submitted, so a widget silently holding the first
+//     delivery cannot produce a doubled or truncated turn.
+//
+// The live tmux/CLI half of this — a real bracketed paste into a real raw-mode
+// TUI in a real tmux pane — is bin/test_backend_smoke.sh scenario S4; a fake
+// execFileSync cannot show that a CLI consumed a prompt.
+// ---------------------------------------------------------------------------
+
+// A task-sized prompt, the shape the issue reproduced with.
+const LONG_CODEX_PROMPT = 'Reply exactly HIVE_PASTE_CHECK_OK. Do not use tools. Inert padding: ' + 'padding '.repeat(850);
+
+// The codex pane after the raw burst that reproduced #9078: the widget shows
+// its idle hint as if nothing had been typed.
+const CODEX_IDLE_HINT_PANE = [
+  '\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e',
+  '\u2502 >_ OpenAI Codex (v0.157.1)                          \u2502',
+  '\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f',
+  '',
+  '\u203a Ask Codex to do anything',
+  '  gpt-6-astra medium \u00b7 ~/.local/state/hive/agent-cwd',
+].join('\n');
+
+// The same pane four seconds later: the truncated placeholder has surfaced,
+// still unsubmitted.
+const CODEX_LATE_TRUNCATED_PASTE_PANE = [
+  '\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e',
+  '\u2502 >_ OpenAI Codex (v0.157.1)                          \u2502',
+  '\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f',
+  '',
+  '\u203a [Pasted Content 4096 chars]',
+  '  gpt-6-astra medium \u00b7 ~/.local/state/hive/agent-cwd',
+].join('\n');
+
+const CODEX_TURN_IN_FLIGHT_PANE = [
+  '\u203a [Pasted Content 6868 chars]',
+  '',
+  '\u2022 Working (2s \u2022 esc to interrupt)',
+  '',
+  '\u203a Ask Codex to do anything',
+  '  gpt-6-astra medium \u00b7 ~/.local/state/hive/agent-cwd',
+].join('\n');
+
+function assignLongCodexTask(relay, taskId) {
+  relay.setCliReady(true);
+  relay.handleMessage(JSON.stringify({
+    type: 'task_assign', task_id: taskId, kind: 'issue', repo: 'foo/bar', number: 9078,
+    title: 'long prompt', prompt: LONG_CODEX_PROMPT,
+  }));
+}
+
+test('#9078 a codex task prompt is delivered as one bracketed paste, never as a literal keystroke burst', () => {
+  const relay = loadRelay({ backend: 'codex', paneText: CODEX_TURN_IN_FLIGHT_PANE });
+  try {
+    assignLongCodexTask(relay, 'ct-9078-paste');
+    assert.deepStrictEqual(relay.__pasteDeliveries(), [LONG_CODEX_PROMPT],
+      'the whole prompt must go to tmux exactly once, on load-buffer\'s stdin');
+    assert.ok(!relay.__tmuxSends().some(c => / -l /.test(c) && c.includes('Inert padding')),
+      'the prompt must not ALSO be typed as a raw burst — that is the delivery that fails');
+    const tmuxCalls = relay.__execFileSyncCalls.filter(c => c.bin === 'tmux').map(c => c.args);
+    const load = tmuxCalls.find(a => a[0] === 'load-buffer');
+    const paste = tmuxCalls.find(a => a[0] === 'paste-buffer');
+    assert.ok(load && paste, 'both halves of the paste must run');
+    const bufferName = load[load.indexOf('-b') + 1];
+    assert.ok(/^hive-prompt-\d+-\d+$/.test(bufferName), `the buffer is named per delivery, got ${bufferName}`);
+    assert.strictEqual(paste[paste.indexOf('-b') + 1], bufferName, 'paste-buffer must paste the buffer load-buffer filled');
+    assert.ok(paste.includes('-p'), 'the paste must be BRACKETED (-p): that is what makes codex take it as one paste');
+    assert.ok(paste.includes('-d'), 'the buffer must be deleted once pasted — a prompt is not something to leave in the tmux paste stack');
+    assert.deepStrictEqual(paste.slice(paste.indexOf('-t'), paste.indexOf('-t') + 2), ['-t', 'contributor']);
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_STARTED,
+      'a pane showing the working row after Enter is a turn that started');
+    assert.strictEqual(relay.getTaskPromptDelivered(), true);
+  } finally { teardown(relay); }
+});
+
+test('#9078 the bracketed paste is scoped to codex — other backends keep the literal burst', () => {
+  const relay = loadRelay({ backend: 'copilot' });
+  try {
+    assignLongCodexTask(relay, 'ct-9078-copilot');
+    assert.deepStrictEqual(relay.__pasteDeliveries(), [],
+      'a backend whose pane has not shown the failure must not be moved to a transport nobody has watched it consume');
+    assert.ok(relay.__tmuxSends().some(c => / -l /.test(c) && c.includes('Inert padding')),
+      'the literal burst is still how every other backend gets its prompt');
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_SENT,
+      'and with no known rendering the only honest answer is "sent"');
+  } finally { teardown(relay); }
+});
+
+test('#9078 a codex widget still showing its idle hint after Enter is UNKNOWN, not submitted', () => {
+  const relay = loadRelay({ backend: 'codex', paneText: CODEX_IDLE_HINT_PANE });
+  try {
+    const entersBefore = relay.__tmuxSends().filter(c => /send-keys .* Enter$/.test(c)).length;
+    assignLongCodexTask(relay, 'ct-9078-idle-hint');
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_UNKNOWN,
+      'an empty-looking widget is not evidence the prompt was submitted — codex holds a raw burst invisibly');
+    assert.strictEqual(relay.getTaskPromptDelivered(), true,
+      'the keystrokes did reach the pane; #5650\'s question is answered yes so the tick judges rather than waits');
+    const entersAfter = relay.__tmuxSends().filter(c => /send-keys .* Enter$/.test(c)).length;
+    assert.strictEqual(entersAfter - entersBefore, 3,
+      'no placeholder, no extra Enter beyond the ENTER_COUNT submit: an Enter into a widget holding an invisible burst is what started nothing');
+    assert.strictEqual(relay.__pasteDeliveries().length, 1,
+      'and never a second paste — the widget may be holding the first one');
+  } finally { teardown(relay); }
+});
+
+test('#9078 a codex turn in flight at the top of a tall pane is WORKING and acknowledged', () => {
+  // `tmux capture-pane -p` returns every row of the pane, blank ones
+  // included. On the contributor image's 200×50 pane a fresh session draws
+  // its status row near the top with forty blank rows beneath, and a raw
+  // last-15-rows slice saw only blanks — a turn in flight read as idle, and
+  // the turn-start wait would have run its whole budget and reported UNKNOWN
+  // for a turn that had plainly begun.
+  const tallPane = CODEX_TURN_IN_FLIGHT_PANE + '\n'.repeat(40);
+  const relay = loadRelay({ backend: 'codex', paneText: tallPane });
+  try {
+    assert.strictEqual(relay.classifyTmuxPane(tallPane), relay.PANE_STATE_WORKING,
+      'the working row is the same evidence whether or not blank rows follow it');
+    assert.strictEqual(relay.confirmPromptSubmitted(), relay.PROMPT_ACK_STARTED);
+  } finally { teardown(relay); }
+});
+
+test('#9078 the turn-start wait is bounded and stops at the first working row', () => {
+  let armed = false;
+  let captures = 0;
+  const relay = loadRelay({
+    backend: 'codex',
+    paneText: () => (armed && ++captures > 3 ? CODEX_TURN_IN_FLIGHT_PANE : CODEX_IDLE_HINT_PANE),
+  });
+  armed = true;
+  try {
+    assert.strictEqual(relay.confirmPromptSubmitted(), relay.PROMPT_ACK_STARTED);
+    assert.ok(captures <= 4, `the wait must return on the capture that shows the turn, not run its whole budget (${captures} captures)`);
+    assert.ok(relay.PROMPT_ACK_POLLS >= 5 && relay.PROMPT_ACK_POLLS <= 60,
+      `the wait must be a bounded handful of seconds, got ${relay.PROMPT_ACK_POLLS} polls`);
+  } finally { teardown(relay); }
+});
+
+// THE REGRESSION, from the recovery side: the live incident shape, where the
+// pane never changes after the Enter.
+test('#9078 an unconfirmed delivery whose pane is unchanged at the next tick is failed on that tick, not after the idle grace', () => {
+  const relay = loadRelay({ backend: 'codex', paneText: CODEX_IDLE_HINT_PANE });
+  try {
+    assignLongCodexTask(relay, 'ct-9078-unchanged');
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_UNKNOWN, 'precondition');
+    relay.__crashTick();
+    const failed = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failed.length, 1,
+      `ONE tick with the pane unchanged is the bound — not ${relay.CHROME_IDLE_GRACE_TICKS} idle-grace ticks; got ${JSON.stringify(relay.__sent.map(m => m.type))}`);
+    assert.strictEqual(failed[0].failure_kind, 'environment');
+    assert.match(failed[0].reason, /never submitted/);
+    assert.notStrictEqual(failed[0].permanent, true, 'a delivery failure is transient — the hub re-offers the issue');
+    assert.deepStrictEqual(relay.__sent.filter(m => m.type === 'task_complete'), []);
+    assert.strictEqual(relay.__pasteDeliveries().length, 1, 'recovery is hand-back and relaunch, never a re-paste');
+    assert.strictEqual(relay.getCurrentTask(), null);
+  } finally { teardown(relay); }
+});
+
+test('#9078 a truncated placeholder that surfaces late is failed without submitting it', () => {
+  // The issue's raw-input capture: idle hint through the whole delivery
+  // window, then "[Pasted Content 4096 chars]" of a 6,868-char prompt.
+  let late = false;
+  const relay = loadRelay({
+    backend: 'codex',
+    paneText: () => (late ? CODEX_LATE_TRUNCATED_PASTE_PANE : CODEX_IDLE_HINT_PANE),
+  });
+  try {
+    assignLongCodexTask(relay, 'ct-9078-late-marker');
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_UNKNOWN, 'precondition');
+    late = true;
+    const sendsBefore = relay.__tmuxSends().length;
+    relay.__crashTick();
+    const failed = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failed.length, 1, 'a prompt still in the widget a tick later was never a turn');
+    assert.match(failed[0].reason, /still collapsed in the input widget/);
+    // The tick's first keystroke into the pane must be the C-c that stops the
+    // CLI, never an Enter: 4096 of 6868 chars is not the task, and it is the
+    // relaunch that clears the widget.
+    const tickSends = relay.__tmuxSends().slice(sendsBefore);
+    const firstEnter = tickSends.findIndex(c => /send-keys -t \S+ Enter$/.test(c));
+    const firstInterrupt = tickSends.findIndex(c => /send-keys -t \S+ C-c$/.test(c));
+    assert.ok(firstInterrupt >= 0, `the failure must stop the CLI, got ${JSON.stringify(tickSends)}`);
+    assert.ok(firstEnter === -1 || firstEnter > firstInterrupt,
+      `no Enter may reach the widget before the CLI is stopped, got ${JSON.stringify(tickSends)}`);
+  } finally { teardown(relay); }
+});
+
+test('#9078 an unconfirmed delivery whose pane has moved on is judged by the ordinary path, not failed', () => {
+  // The relay missed the turn beginning (a slow first redraw); by the next
+  // tick the turn has finished. Nothing argues against submission any more.
+  let ticking = false;
+  const relay = loadRelay({
+    backend: 'codex',
+    paneText: () => (ticking ? CODEX_FINISHED_TURN_PANE : CODEX_IDLE_HINT_PANE),
+  });
+  try {
+    assignLongCodexTask(relay, 'ct-9078-late-start');
+    relay.setDeliveredVerdictBaseline(null);
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_UNKNOWN, 'precondition');
+    ticking = true;
+    graceTicks(relay, () => relay.__crashTick());
+    assert.deepStrictEqual(relay.__sent.filter(m => m.type === 'task_failed'), [],
+      'a pane that changed since delivery is not a never-submitted prompt');
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 1);
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_SENT,
+      'the ack is downgraded to "sent" once, so the tick does not re-litigate delivery every interval');
+  } finally { teardown(relay); }
+});
+
+test('#9078 a paste-buffer that fails is retried and the buffer is never left behind', () => {
+  const relay = loadRelay({ backend: 'codex', paneText: CODEX_TURN_IN_FLIGHT_PANE });
+  try {
+    relay.__failNextNudge();
+    assignLongCodexTask(relay, 'ct-9078-paste-fails');
+    const tmuxCalls = relay.__execFileSyncCalls.filter(c => c.bin === 'tmux').map(c => c.args);
+    const loads = tmuxCalls.filter(a => a[0] === 'load-buffer');
+    const pastes = tmuxCalls.filter(a => a[0] === 'paste-buffer');
+    assert.strictEqual(loads.length, 2, 'the send loop retries the whole delivery after a tmux error');
+    assert.strictEqual(pastes.length, 2);
+    const failedBuffer = loads[0][loads[0].indexOf('-b') + 1];
+    assert.ok(tmuxCalls.some(a => a[0] === 'delete-buffer' && a[a.indexOf('-b') + 1] === failedBuffer),
+      'the buffer whose paste threw must be deleted explicitly — -d never ran for it');
+    assert.strictEqual(relay.getTaskPromptDelivered(), true);
+    assert.strictEqual(relay.getPromptAck(), relay.PROMPT_ACK_STARTED);
   } finally { teardown(relay); }
 });
 

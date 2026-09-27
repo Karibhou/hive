@@ -4202,7 +4202,7 @@ function tmuxSendEnters() {
   }
 }
 
-// ── Confirming the prompt was SUBMITTED, not just typed (#6717) ─────────────
+// ── Confirming the prompt was SUBMITTED, not just typed (#6717, #9078) ──────
 //
 // tmuxSendEnters() has always been fire-and-forget: the send loop below retries
 // when tmux itself errors, but nothing ever checked whether the keystrokes
@@ -4220,41 +4220,155 @@ const PROMPT_PASTE_SETTLE_MS = 1200;
 const PROMPT_SUBMIT_RETRIES = 3;
 const PROMPT_SUBMIT_RETRY_DELAY_MS = 1500;
 
-// confirmPromptSubmitted re-sends Enter while the pane still shows the prompt
-// collapsed in its input widget, and reports whether it ended up submitted.
+// ── Delivering the prompt as an explicit bracketed paste (#9078) ────────────
 //
-// Returns true both when submission is confirmed and when this backend's
-// widget rendering is unknown to paneHoldsUnsubmittedPrompt() — "no evidence of
-// a stuck prompt" is the only honest answer there, and it is also the
-// pre-#6717 behaviour, so no backend regresses into extra keystrokes it never
-// needed. The chrome-idle veto in progressTick() is the backstop for whatever
-// this cannot see.
+// `tmux send-keys -l` types the prompt as a raw keystroke burst, and codex
+// 0.157.1 does not reliably turn a task-sized burst into a submitted turn:
+// observed live with a ~6.8 KB prompt, the input widget kept showing its idle
+// "› Ask Codex to do anything" hint, the Enters that followed started nothing,
+// and only seconds later did a "[Pasted Content 4096 chars]" placeholder
+// appear — 4096 of 6868 characters, still unsubmitted. The same prompt handed
+// over as an explicit bracketed paste (`tmux load-buffer` + `paste-buffer -p`)
+// rendered the full "[Pasted Content 6868 chars]" placeholder at once and the
+// following Enter started the turn.
+//
+// PER BACKEND, and deliberately only where the effect has been SEEN, exactly
+// as PASTE_PLACEHOLDER_PATTERNS is scoped: the literal path is what every
+// other backend has always received and none of them has shown this failure.
+// The same set gates the turn-start wait in confirmPromptSubmitted() below,
+// because both rest on the same observed codex rendering. Add a backend here
+// when its own pane capture shows the raw burst failing and the paste working.
+const PASTE_DELIVERY_BACKENDS = new Set(['codex']);
+
+// tmuxDeliverPromptText puts the prompt text into the input widget — the
+// keystroke burst or the bracketed paste, per backend — WITHOUT submitting it.
+// Returns the transport used, for the log line.
+//
+// The paste path never touches a shell: the text goes to tmux on stdin
+// (`load-buffer -`, so there is no argv length ceiling either) and every
+// argument is an argv element. The buffer is named per delivery so a
+// concurrent relay on the same tmux server cannot paste this prompt, and it
+// is deleted whether or not the paste succeeded: `-d` frees it on the happy
+// path, and the finally covers a paste-buffer that threw.
+function tmuxDeliverPromptText(text) {
+  if (!PASTE_DELIVERY_BACKENDS.has(BACKEND)) {
+    execSync(`tmux send-keys -t ${TMUX_SESSION} -l ${shellQuote(text)}`, { timeout: 30000 });
+    return 'literal keystrokes';
+  }
+  const buffer = `hive-prompt-${process.pid}-${Date.now()}`;
+  try {
+    execFileSync('tmux', ['load-buffer', '-b', buffer, '-'], { input: text, timeout: 30000 });
+    execFileSync('tmux', ['paste-buffer', '-p', '-d', '-b', buffer, '-t', TMUX_SESSION], { timeout: 30000 });
+  } finally {
+    try { execFileSync('tmux', ['delete-buffer', '-b', buffer], { timeout: 15000, stdio: 'ignore' }); } catch (_) {}
+  }
+  return 'bracketed paste';
+}
+
+// The three things the relay can honestly say about a prompt after the Enter
+// that was meant to submit it (#9078). "typed" was never "submitted", and —
+// the gap #6717 left — "no placeholder in the widget" was never "submitted"
+// either: codex can hold a raw burst in a widget that still shows its idle
+// hint, and an Enter into that widget starts nothing.
+//
+//   PROMPT_ACK_SENT     the keystrokes reached the pane and nothing on it
+//                       argues they were not submitted. The only answer for
+//                       a backend whose widget rendering has not been
+//                       captured, and the pre-#9078 behaviour for every one
+//                       of them.
+//   PROMPT_ACK_STARTED  the backend visibly began a turn on this prompt: its
+//                       working chrome, a tool row, or a verdict line that
+//                       was not on the pane at delivery.
+//   PROMPT_ACK_UNKNOWN  the widget still held the collapsed prompt after the
+//                       Enter budget, or no turn started within the wait.
+//                       The agent has been given NOTHING it can be judged on
+//                       yet; progressTick() fails the task at its next look
+//                       unless the pane has moved on by then.
+const PROMPT_ACK_SENT = 'sent';
+const PROMPT_ACK_STARTED = 'started';
+const PROMPT_ACK_UNKNOWN = 'unknown';
+
+// How long, and how often, to look for the turn to start after the submit.
+// codex renders its working chrome the instant a turn begins — it is a local
+// redraw, not an API round trip — so a pane that shows nothing of the kind
+// for this long after Enter has not started one. Bounded in POLLS, not wall
+// clock, so the loop is deterministic under HIVE_RELAY_TEST_MODE where
+// sleepMs() is a no-op.
+const PROMPT_ACK_WINDOW_MS = 15000;
+const PROMPT_ACK_POLL_MS = 1000;
+const PROMPT_ACK_POLLS = Math.ceil(PROMPT_ACK_WINDOW_MS / PROMPT_ACK_POLL_MS);
+
+// paneShowsTurnStarted reports whether the pane carries positive evidence
+// that the backend began a turn since this task's prompt was delivered. The
+// working chrome is the direct signal; the activity rows and verdict lines
+// are what a turn that has already finished — or moved past its spinner —
+// leaves behind, counted against the delivery baseline so a previous task's
+// rows cannot vouch for this one.
+function paneShowsTurnStarted(text) {
+  if (classifyTmuxPane(text) === PANE_STATE_WORKING) return true;
+  return recordTaskAgentActivity(String(text || '').split('\n'));
+}
+
+// confirmPromptSubmitted re-sends Enter while the pane still shows the prompt
+// collapsed in its input widget, then — for the backends whose rendering is
+// known — waits for the turn to visibly start, and reports which of the three
+// PROMPT_ACK_* outcomes it observed.
+//
+// Returns PROMPT_ACK_SENT both when nothing argues against submission and
+// when this backend's widget rendering is unknown to paneHoldsUnsubmittedPrompt()
+// — "no evidence of a stuck prompt" is the only honest answer there, and it is
+// also the pre-#6717 behaviour, so no backend regresses into extra keystrokes
+// or waits it never needed. The chrome-idle veto in progressTick() is the
+// backstop for whatever this cannot see.
 //
 // A bare Enter is the only key sent, and only while the placeholder is still
 // there: on a pane that did submit, the widget is empty (or holding its
-// "Ask Codex to…" placeholder) and an Enter is a no-op.
+// "Ask Codex to…" placeholder) and an Enter is a no-op. Never a second paste:
+// a prompt the widget is holding invisibly would be doubled, and the agent
+// would run a task nobody wrote.
 function confirmPromptSubmitted() {
-  if (!paneHoldsUnsubmittedPrompt(capturePaneText(), BACKEND)) return true;
-  for (let attempt = 1; attempt <= PROMPT_SUBMIT_RETRIES; attempt++) {
-    console.warn(`Task prompt is still sitting unsubmitted in the ${BACKEND} input widget (collapsed paste) — re-sending Enter, attempt ${attempt}/${PROMPT_SUBMIT_RETRIES}`);
-    try {
-      execSync(`tmux send-keys -t ${TMUX_SESSION} Enter`, { timeout: 15000 });
-    } catch (e) {
-      console.error(`Re-sending Enter failed: ${e.message}`);
+  const awaitsTurn = PASTE_DELIVERY_BACKENDS.has(BACKEND);
+  let entersSent = 0;
+  for (let poll = 0; ; poll++) {
+    const pane = capturePaneText();
+    // Checked BEFORE the placeholder: codex can echo a submitted paste's
+    // placeholder into the transcript right above its working row, and a
+    // turn that is visibly running outranks a marker that may be history.
+    if (awaitsTurn && paneShowsTurnStarted(pane)) {
+      if (entersSent > 0) console.log(`Task prompt submitted after ${entersSent} extra Enter(s)`);
+      console.log(`${BACKEND} started a turn on the task prompt (seen on pane check ${poll + 1})`);
+      return PROMPT_ACK_STARTED;
     }
-    sleepMs(PROMPT_SUBMIT_RETRY_DELAY_MS);
-    if (!paneHoldsUnsubmittedPrompt(capturePaneText(), BACKEND)) {
-      console.log(`Task prompt submitted after ${attempt} extra Enter(s)`);
-      return true;
+    if (paneHoldsUnsubmittedPrompt(pane, BACKEND)) {
+      if (entersSent >= PROMPT_SUBMIT_RETRIES) {
+        // Deliberately NOT a silent give-up, and deliberately not left for the
+        // 30-minute lease to notice either. The prompt is still in the widget,
+        // so the agent has been told nothing — say so at the moment it is
+        // known, and let progressTick() turn it into a FAILURE the hub
+        // re-offers rather than the false completion #6717 reports.
+        console.error(`Task prompt could NOT be submitted to ${BACKEND} after ${PROMPT_SUBMIT_RETRIES} extra Enter(s) — the agent has not been given this task`);
+        return PROMPT_ACK_UNKNOWN;
+      }
+      entersSent++;
+      console.warn(`Task prompt is still sitting unsubmitted in the ${BACKEND} input widget (collapsed paste) — re-sending Enter, attempt ${entersSent}/${PROMPT_SUBMIT_RETRIES}`);
+      try {
+        execSync(`tmux send-keys -t ${TMUX_SESSION} Enter`, { timeout: 15000 });
+      } catch (e) {
+        console.error(`Re-sending Enter failed: ${e.message}`);
+      }
+      sleepMs(PROMPT_SUBMIT_RETRY_DELAY_MS);
+      continue;
     }
+    if (!awaitsTurn) {
+      if (entersSent > 0) console.log(`Task prompt submitted after ${entersSent} extra Enter(s)`);
+      return PROMPT_ACK_SENT;
+    }
+    if (poll >= PROMPT_ACK_POLLS) {
+      console.error(`Task prompt sent to ${BACKEND} but no turn started within ${PROMPT_ACK_WINDOW_MS / 1000}s — submission UNKNOWN; the pane will be re-checked on the next progress tick and the task failed if nothing has run by then (#9078)`);
+      return PROMPT_ACK_UNKNOWN;
+    }
+    sleepMs(PROMPT_ACK_POLL_MS);
   }
-  // Deliberately NOT a silent give-up, and deliberately not left for the
-  // 30-minute lease to notice either. The prompt is still in the widget, so the
-  // agent has been told nothing — say so at the moment it is known, and let the
-  // chrome-idle veto turn the resulting empty pane into a FAILURE the hub
-  // re-offers rather than the false completion #6717 reports.
-  console.error(`Task prompt could NOT be submitted to ${BACKEND} after ${PROMPT_SUBMIT_RETRIES} extra Enter(s) — the agent has not been given this task`);
-  return false;
 }
 
 // ── "Has this agent done anything at all since it was prompted?" (#6717) ────
@@ -4270,11 +4384,12 @@ function confirmPromptSubmitted() {
 // returns before any of this is consulted.
 let promptDeliveryFingerprint = null;
 
-// False only once confirmPromptSubmitted() has SEEN the prompt stuck in the
-// input widget and failed to clear it. Default true so that every backend
-// whose widget rendering is unknown, and every path that never reaches the
-// send loop, behaves exactly as it did before #6717.
-let promptSubmissionConfirmed = true;
+// What confirmPromptSubmitted() concluded about the current task's prompt.
+// PROMPT_ACK_UNKNOWN only once it has SEEN the prompt stuck in the widget or
+// waited out the turn-start window without a turn. Default SENT so that every
+// backend whose widget rendering is unknown, and every path that never
+// reaches the send loop, behaves exactly as it did before #6717.
+let promptAck = PROMPT_ACK_SENT;
 
 function paneFingerprint(tmuxLines) {
   return Array.isArray(tmuxLines) ? tmuxLines.join('\n') : String(tmuxLines || '');
@@ -4322,12 +4437,13 @@ function tmuxSendKeys(text) {
   taskPromptDelivered = false;
   // Same up-front clear, same reason (#6717): a queued or abandoned send has
   // submitted nothing and left no delivery snapshot to compare a pane against.
-  promptSubmissionConfirmed = true;
+  promptAck = PROMPT_ACK_SENT;
   promptDeliveryFingerprint = null;
-  // Hard gate (issue #2203, bug 2): `send-keys -l` types literal keystrokes
-  // into whatever owns the pane. If the CLI is not confirmed ready, those
-  // keystrokes land on bash, whose readline chokes on the apostrophes in the
-  // prompt and drops the pane into PS2 continuation, wedging it permanently.
+  // Hard gate (issue #2203, bug 2): `send-keys -l` types literal keystrokes —
+  // and `paste-buffer` pastes them — into whatever owns the pane. If the CLI
+  // is not confirmed ready, those keystrokes land on bash, whose readline
+  // chokes on the apostrophes in the prompt and drops the pane into PS2
+  // continuation, wedging it permanently.
   // Queue instead; flushPendingTask() delivers it once readiness is confirmed.
   //
   // cliReady is a LATCH: set once the CLI is confirmed up, cleared only by a
@@ -4440,7 +4556,7 @@ function tmuxSendKeys(text) {
         execSync(`tmux send-keys -t ${TMUX_SESSION} C-a`, { timeout: 15000 });
         execSync(`tmux send-keys -t ${TMUX_SESSION} C-k`, { timeout: 15000 });
         sleepMs(200);
-        execSync(`tmux send-keys -t ${TMUX_SESSION} -l ${shellQuote(text)}`, { timeout: 30000 });
+        const transport = tmuxDeliverPromptText(text);
         // #6717: settle before submitting. A task prompt is ~2 KB and arrives
         // as one burst; a TUI with bracketed-paste handling is still ingesting
         // it 300ms later, and an Enter that lands while the widget is in that
@@ -4450,17 +4566,19 @@ function tmuxSendKeys(text) {
         // costs the test suite nothing.
         sleepMs(PROMPT_PASTE_SETTLE_MS);
         tmuxSendEnters();
-        console.log('Task prompt sent to CLI');
+        console.log(`Task prompt sent to CLI (${transport}, ${text.length} chars)`);
         // #6717: "typed" is not "submitted". Check the pane and re-send Enter
-        // if the prompt is still collapsed in the input widget.
+        // if the prompt is still collapsed in the input widget; #9078: then
+        // wait for the turn to visibly start where that rendering is known.
         //
         // taskPromptDelivered is set TRUE either way, on purpose. It answers
         // #5650's question — "did these keystrokes reach the pane" — and they
         // did; a false here would park the task on progressTick()'s
         // no-judgement branch until the max-duration lease expired, silently,
         // half an hour later. The unsubmitted case is instead reported as a
-        // FAILURE by the chrome-idle veto, which has the evidence to say so.
-        promptSubmissionConfirmed = confirmPromptSubmitted();
+        // FAILURE by progressTick(), which has the evidence to say so.
+        promptAck = confirmPromptSubmitted();
+        console.log(`Task prompt delivery: ${promptAck}`);
         // The delivery snapshot, taken AFTER the submit attempts: everything
         // the agent draws from here on changes it, and a pane still identical
         // to it when the chrome-idle grace elapses has produced nothing at all.
@@ -7163,6 +7281,35 @@ function progressTick() {
   // as far as a progress report (#5447). Warn-only — see warnOnTokenExpiry.
   warnOnTokenExpiry();
 
+  // #9078: a prompt whose submission is UNKNOWN is judged BEFORE the grace
+  // period, because the question is not "has the agent finished" but "was
+  // the agent ever given anything" — and the answer costs one pane read. The
+  // send path already waited PROMPT_ACK_WINDOW_MS for the turn to start; a
+  // pane that is STILL byte-identical to the delivery snapshot one progress
+  // interval later, or still holding the collapsed prompt in its widget, has
+  // not started one. Failing here is what bounds recovery to a couple of
+  // minutes instead of the eight the chrome-idle grace used to take, and it
+  // never re-pastes: the hub re-offers the issue and the relay relaunches the
+  // CLI, so the next delivery starts from a widget that holds nothing.
+  if (promptAck === PROMPT_ACK_UNKNOWN && taskPromptDelivered && CONTRIBUTOR_MODE !== MODE_HEADLESS) {
+    const ackLines = captureTmuxLines(TMUX_TAIL_LINES);
+    const stillInWidget = paneHoldsUnsubmittedPrompt(ackLines.join('\n'), BACKEND);
+    if (stillInWidget || !paneChangedSinceDelivery(ackLines)) {
+      const sinceDelivery = Math.round((Date.now() - taskAssignedAt) / 1000);
+      console.error(`Task ${currentTask.task_id}: ${BACKEND} never started a turn on the task prompt — ${stillInWidget ? 'it is still collapsed in the input widget' : 'the pane is unchanged since delivery'} ${sinceDelivery}s after dispatch. Reporting it FAILED so the hub re-offers the issue (#9078).`);
+      resetChromeIdleGrace();
+      failCurrentTask(`task prompt was never submitted to the ${BACKEND} CLI — ${stillInWidget ? 'it is still collapsed in the input widget' : 'the pane is unchanged since delivery'} and no turn started; prompt may not have been submitted`, { kind: 'environment' });
+      return;
+    }
+    // The pane moved on without this relay seeing the turn begin — a slow
+    // first redraw, or output the classifier does not recognise. Downgrade
+    // to "sent": nothing argues against submission any more, and the
+    // ordinary #6717 veto below still owns the case where it turns out that
+    // nothing ran.
+    console.log(`Task ${currentTask.task_id}: the pane changed after an unconfirmed delivery — treating the prompt as sent`);
+    promptAck = PROMPT_ACK_SENT;
+  }
+
   if (Date.now() - taskAssignedAt < TASK_GRACE_PERIOD_MS) return;
 
   // #4117: re-detect the running model each tick so a mid-session model switch
@@ -7388,10 +7535,10 @@ function progressTick() {
   // agent's own statement and needs no corroboration from the chrome; it also
   // cannot be on a pane that never changed, since the baseline suppression in
   // #5650 already removes the previous task's line.
-  // Signal 1, from either side: the send path already failed to clear the
-  // widget, or the pane still shows a collapsed paste sitting in it.
-  const promptStillInWidget = !promptSubmissionConfirmed ||
-    paneHoldsUnsubmittedPrompt(paneScanLines.join('\n'), BACKEND);
+  // Signal 1: the pane still shows a collapsed paste sitting in the widget.
+  // (A delivery the send path itself could not confirm never reaches here:
+  // the #9078 check above has already failed it or seen the pane move on.)
+  const promptStillInWidget = paneHoldsUnsubmittedPrompt(paneScanLines.join('\n'), BACKEND);
   // Signal 2. The deep capture is used for the widget above because
   // paneHoldsUnsubmittedPrompt() scopes itself to the input rows at its end;
   // the fingerprint compares the same TMUX_TAIL_LINES window the delivery
@@ -8593,15 +8740,22 @@ if (process.env.HIVE_RELAY_TEST_MODE === '1') {
     // Per-task prompt-delivery surface (kubestellar/hive#5650).
     getTaskPromptDelivered: () => taskPromptDelivered,
     setTaskPromptDelivered: (v) => { taskPromptDelivered = v; },
-    // Prompt-SUBMISSION surface (#6717): typed is not submitted.
+    // Prompt-SUBMISSION surface (#6717, #9078): typed is not submitted, and
+    // "no placeholder" is not submitted either.
     PROMPT_PASTE_SETTLE_MS,
     PROMPT_SUBMIT_RETRIES,
+    PROMPT_ACK_POLLS,
+    PROMPT_ACK_SENT,
+    PROMPT_ACK_STARTED,
+    PROMPT_ACK_UNKNOWN,
+    PASTE_DELIVERY_BACKENDS,
+    tmuxDeliverPromptText,
     confirmPromptSubmitted,
     paneHoldsUnsubmittedPrompt,
     paneChangedSinceDelivery,
     paneFingerprint,
-    getPromptSubmissionConfirmed: () => promptSubmissionConfirmed,
-    setPromptSubmissionConfirmed: (v) => { promptSubmissionConfirmed = v; },
+    getPromptAck: () => promptAck,
+    setPromptAck: (v) => { promptAck = v; },
     getPromptDeliveryFingerprint: () => promptDeliveryFingerprint,
     setPromptDeliveryFingerprint: (v) => { promptDeliveryFingerprint = v; },
     getDeliveredVerdictBaseline: () => deliveredVerdictBaseline,

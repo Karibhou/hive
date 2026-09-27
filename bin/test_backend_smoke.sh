@@ -21,7 +21,9 @@
 #         src/Dockerfile.contributor.
 #   S  stub wire-contract scenarios — keyless, deterministic: a stub backend
 #      binary on PATH drives the full relay↔hub loop, locking the wire shape
-#      the live scenarios (and the hub) rely on, with zero API spend.
+#      the live scenarios (and the hub) rely on, with zero API spend. S4 is
+#      the task-prompt DELIVERY check (#9078): a real tmux pane, a raw-mode
+#      bracketed-paste stub, exactly-once byte-for-byte submission.
 #   B  live per-backend scenarios (needs the CLI + a credential; skips
 #      otherwise — fatally under HIVE_TEST_REQUIRE_BACKEND_SMOKE=1):
 #      B0 detect_cli health probe (contributor-agent.sh's own seam);
@@ -432,6 +434,175 @@ OMP
     stop_scenario
   else
     skip "tmux not installed — OMP interactive stub scenario skipped"
+  fi
+
+  # S4 (#9078): task-prompt DELIVERY through a real tmux pane into a real
+  # raw-mode TUI. The unit suite stubs child_process, so nothing there can show
+  # that a CLI actually consumed a prompt — which is exactly the seam that
+  # broke: codex 0.157.1 held a ~6.8 KB `send-keys -l` burst invisibly, the
+  # Enters started nothing, and a truncated "[Pasted Content 4096 chars]"
+  # surfaced seconds later. The stub below is a fixture of THAT captured
+  # behaviour, the way bin/testdata/pane-fixtures are fixtures of captured
+  # panes: it enables bracketed paste like the real TUI, takes an explicit
+  # bracketed paste as one composer edit and submits it on Enter, and treats a
+  # large raw burst the way the live CLI was observed to — buffered off-screen,
+  # Enter swallowed, placeholder late and short. It records every SUBMITTED
+  # turn as JSONL so the scenario can assert exactly-once, full-length
+  # delivery. Two prompts: task-sized (the failure) and short (the control).
+  echo ""
+  echo "-- S4: codex-shaped stub — task-sized prompt is delivered as one bracketed paste and starts exactly one turn --"
+  if command -v tmux >/dev/null 2>&1; then
+    STUB_CODEX="$WORK/stub-codex"
+    mkdir -p "$STUB_CODEX" "$WORK/ws-codex"
+    cat > "$STUB_CODEX/codex" <<'CODEX'
+#!/usr/bin/env node
+// codex-shaped interactive stub for bin/test_backend_smoke.sh S4 (#9078).
+// Raw-mode stdin, bracketed paste enabled, the real TUI's idle hint and
+// working/placeholder chrome, and the observed 0.157.1 raw-burst behaviour.
+const fs = require('fs');
+const turnsLog = process.env.CODEX_STUB_TURNS;
+const IDLE = '\u203a Ask Codex to do anything';
+const LARGE_PASTE = 1000;           // codex LARGE_PASTE_CHAR_THRESHOLD
+const RAW_BURST_QUIET_MS = 4000;    // observed: placeholder surfaced ~4 s later
+const RAW_BURST_SHOWN = 4096;       // observed: "[Pasted Content 4096 chars]"
+const out = (s) => process.stdout.write(s);
+let composer = '';
+let composerFromPaste = false;
+let rawBurst = '';
+let rawTimer = null;
+let pending = '';
+let inPaste = false;
+let turns = 0;
+process.stdin.setRawMode(true);
+process.stdin.resume();
+out('\x1b[?2004h');
+out('\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n');
+out('\u2502 >_ OpenAI Codex (v0.157.1)   \u2502\n');
+out('\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n\n');
+out(IDLE + '\n');
+function submit() {
+  const text = composer.replace(/\r\n?/g, '\n');
+  composer = ''; composerFromPaste = false; rawBurst = '';
+  turns++;
+  fs.appendFileSync(turnsLog, JSON.stringify({ turn: turns, chars: text.length, text }) + '\n');
+  out((text.length > LARGE_PASTE ? `\u203a [Pasted Content ${text.length} chars]` : `\u203a ${text}`) + '\n\n');
+  out('\u2022 Working (1s \u2022 esc to interrupt)\n');
+  setTimeout(() => {
+    out('\u2022 Ran echo ok\n');
+    out(`HIVE_VERDICT: complete \u2014 codex paste stub turn ${turns} (${text.length} chars)\n\n`);
+    out(IDLE + '\n');
+  }, 1500);
+}
+function onPaste(text) {
+  composer += text; composerFromPaste = true;
+  out((composer.length > LARGE_PASTE ? `\u203a [Pasted Content ${composer.length} chars]` : `\u203a ${composer}`) + '\n');
+}
+function onRawChar(ch) {
+  // A short typed line renders and submits like typing. A burst past the
+  // large-paste threshold is what the live CLI mishandled: nothing renders,
+  // Enter is swallowed, and a short placeholder appears after a quiet gap.
+  rawBurst += ch;
+  composer += ch;
+  if (rawBurst.length <= LARGE_PASTE) return;
+  clearTimeout(rawTimer);
+  rawTimer = setTimeout(() => {
+    out(`\u203a [Pasted Content ${Math.min(rawBurst.length, RAW_BURST_SHOWN)} chars]\n`);
+  }, RAW_BURST_QUIET_MS);
+}
+process.stdin.on('data', (chunk) => {
+  pending += chunk.toString('utf8');
+  for (;;) {
+    if (inPaste) {
+      const end = pending.indexOf('\x1b[201~');
+      if (end < 0) return;
+      onPaste(pending.slice(0, end));
+      pending = pending.slice(end + 6);
+      inPaste = false;
+      continue;
+    }
+    if (!pending) return;
+    if (pending.startsWith('\x1b[200~')) { inPaste = true; pending = pending.slice(6); continue; }
+    if (pending.startsWith('\x1b[')) {
+      const m = /^\x1b\[[0-9;?]*[A-Za-z~]/.exec(pending);
+      if (!m) return;                       // partial CSI sequence
+      pending = pending.slice(m[0].length);
+      continue;
+    }
+    const ch = pending[0];
+    pending = pending.slice(1);
+    if (ch === '\x03') process.exit(0);    // C-c
+    if (ch === '\x1b' || ch === '\x01' || ch === '\x0b') continue;
+    if (ch === '\r' || ch === '\n') {
+      if (!composer) continue;             // Enter on an empty widget: no-op
+      if (composerFromPaste || rawBurst.length <= LARGE_PASTE) submit();
+      // else: the observed 0.157.1 behaviour — Enter after a large raw burst
+      // starts nothing.
+      continue;
+    }
+    onRawChar(ch);
+  }
+});
+CODEX
+    chmod +x "$STUB_CODEX/codex"
+    LONG_PROMPT="$(node -e "process.stdout.write('Reply exactly HIVE_PASTE_CHECK_OK. Do not use tools. Inert padding: ' + 'padding '.repeat(850))")"
+    SHORT_PROMPT='Reply exactly HIVE_PASTE_CHECK_OK. Do not use tools.'
+    run_s4() {
+      # run_s4 LABEL PROMPT — one relay + fake hub + tmux pane per prompt.
+      local label="$1" prompt="$2" turns="$WORK/codex-turns-$1.jsonl"
+      rm -f "$turns"
+      TMUX_SESS="hive-smoke-codex-$label"
+      tmux kill-session -t "$TMUX_SESS" 2>/dev/null || true
+      local launch
+      launch="CODEX_STUB_TURNS=$(printf %q "$turns") $(printf %q "$STUB_CODEX/codex")"
+      if SMOKE_PROMPT="$prompt" start_fakehub "s4-$label" && \
+         tmux new-session -d -s "$TMUX_SESS" -x 200 -y 50 -c "$WORK/ws-codex"; then
+        tmux send-keys -t "$TMUX_SESS" "$launch" Enter
+        RELAY_LOG="$WORK/relay-codex-$label.log"
+        (
+          cd "$ROOT" || exit 1
+          PATH="$STUB_CODEX:$PATH" \
+          HIVE_RELAY_TEST_TIMING=1 \
+          HOME="$WORK/home-s4-$label" \
+          AGENT_BACKEND=codex \
+          HIVE_AGENT_SESSION="$TMUX_SESS" \
+          HIVE_AGENT_CWD="$WORK/ws-codex" \
+          HIVE_HUB="ws://127.0.0.1:$HUB_PORT/contribute" \
+          HIVE_REGISTRATION_TOKEN=smoke-token \
+          HIVE_WORKSPACE_DIR="$WORK/ws-codex" \
+          HIVE_TASK_FILE="$WORK/task-codex-$label.json" \
+          AGENT_LAUNCH_CMD="$launch" \
+          HIVE_GH_TOKEN_CACHE="$WORK/gh-codex-$label.cache" \
+          exec node "$RELAY"
+        ) >"$RELAY_LOG" 2>&1 &
+        RELAY_PID=$!
+        if wait_for_terminal "$HUB_LOG" 60; then
+          check "S4 [$label] task_complete result" "completed" \
+                "$(msg_field "$HUB_LOG" task_complete .result)"
+          check "S4 [$label] completion signal is verdict" "verdict" \
+                "$(msg_field "$HUB_LOG" task_complete .completion_signal)"
+          check "S4 [$label] the stub started exactly one turn" "1" \
+                "$( [ -f "$turns" ] && wc -l < "$turns" | tr -d ' ' || echo 0)"
+          check "S4 [$label] the turn carried the whole prompt (${#prompt} chars)" "${#prompt}" \
+                "$(jq -r 'first(.chars)' "$turns" 2>/dev/null | head -n1)"
+          check "S4 [$label] the turn's text is the prompt, byte for byte" "true" \
+                "$(jq -r --arg p "$prompt" '.text == $p' "$turns" 2>/dev/null | head -n1)"
+          contains "S4 [$label] the relay reports the bracketed-paste transport" \
+                   "$(cat "$RELAY_LOG")" "Task prompt sent to CLI (bracketed paste"
+          contains "S4 [$label] the relay saw the turn start" \
+                   "$(cat "$RELAY_LOG")" "Task prompt delivery: started"
+        else
+          fail "S4 [$label] reached a terminal message within 60s"
+          dump_evidence "S4-$label" "$RELAY_LOG"
+        fi
+      else
+        fail "fake hub + tmux session started (S4-$label)"
+      fi
+      stop_scenario
+    }
+    run_s4 long "$LONG_PROMPT"
+    run_s4 short "$SHORT_PROMPT"
+  else
+    skip "tmux not installed — codex paste-delivery scenario skipped"
   fi
 fi
 

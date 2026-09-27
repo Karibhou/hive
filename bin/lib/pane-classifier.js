@@ -616,11 +616,12 @@ function paneTail(text, n) {
 
 // ── An input widget still holding a prompt nobody submitted (#6717) ──────────
 //
-// The relay delivers a task prompt by typing it into the pane with
-// `tmux send-keys -l` and then sending Enter. A ~2 KB prompt arrives as one
-// burst, and a TUI that implements bracketed-paste handling classifies a burst
-// that fast as PASTED CONTENT: it collapses the blob to a placeholder in its
-// input widget and takes the newlines that follow as content INSIDE the paste
+// The relay delivers a task prompt into the pane — as `tmux send-keys -l`
+// keystrokes, or for codex as an explicit bracketed `paste-buffer -p` (#9078)
+// — and then sends Enter. A ~2 KB keystroke burst arrives all at once, and a
+// TUI that implements bracketed-paste handling classifies a burst that fast
+// as PASTED CONTENT: it collapses the blob to a placeholder in its input
+// widget and takes the newlines that follow as content INSIDE the paste
 // rather than as submit. The prompt then sits in the widget, unsent, and the
 // agent never runs.
 //
@@ -834,7 +835,16 @@ function classifyPane(text, backend, deps = {}) {
     // Codex retains prior tool rows in its long-lived pane.  Scope transient
     // activity words to the tail so an old "Running" row cannot pin a
     // completed turn in WORKING forever.
-    const codexTail = text.split('\n').slice(-15).join('\n');
+    //
+    // NON-BLANK rows (#9078): `tmux capture-pane -p` returns every row of the
+    // pane, blank ones included, and codex draws inline from the top of the
+    // screen. On the 200×50 pane the contributor image runs, a fresh session's
+    // status row sits at row ten with forty blank rows under it, so a raw
+    // last-15-rows slice was fifteen blank lines and a turn in flight read as
+    // idle until the transcript had filled the screen — the same shape as
+    // #6413 for agy. The relay's turn-start acknowledgement reads this
+    // classification right after the Enter, when the transcript is shortest.
+    const codexTail = paneTail(text, 15);
     // Same marker mismatch as getCLIState(): '›' (U+203A), not '>'.
     hasIdlePrompt = /codex>|›|>\s*$/.test(text);
     // Not a prose match. codex writes its own completion summary in whatever
