@@ -266,7 +266,7 @@ Run:
    transition; save the Telegram notification screenshot/link.
 4. If retry/backoff occurs, save `telegram poll failed`; successful inbound
    messages are delivered after chat-ID filtering and `ioscan`
-   (`src/pkg/telegram/bot.go:171-188`, `src/pkg/telegram/bot.go:208-214`).
+   (`src/pkg/telegram/bot.go:187-210`, `handleUpdate`, `src/pkg/telegram/bot.go:262-267`).
 
 Evidence checklist:
 
