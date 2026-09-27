@@ -215,8 +215,8 @@ func TestRouteMessage_NonAllowlistedUserBlocked(t *testing.T) {
 		called = true
 		return "pong", nil
 	})
-	// A message from a user NOT in the allowlist must be ignored — the command
-	// handler never runs and nothing is sent.
+	// A message from a user NOT in the allowlist must not run — the command
+	// handler never runs and the only reply is the fixed refusal (#9131).
 	msg := makeMsg("1", "!ping", false)
 	msg.AuthorID = "intruder"
 	b.routeMessage(context.Background(), msg)
@@ -224,8 +224,8 @@ func TestRouteMessage_NonAllowlistedUserBlocked(t *testing.T) {
 	if called {
 		t.Error("command handler ran for a non-allowlisted user")
 	}
-	if len(*sent) != 0 {
-		t.Errorf("expected no messages for blocked user, got %v", *sent)
+	if len(*sent) != 1 || !strings.Contains((*sent)[0], "not authorized") || strings.Contains((*sent)[0], "pong") {
+		t.Errorf("expected only the refusal for blocked user, got %v", *sent)
 	}
 }
 

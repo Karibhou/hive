@@ -48,6 +48,10 @@ func (s *Service) routeMessage(ctx context.Context, msg Message) {
 	if msg.FromBot {
 		return
 	}
+	if !s.rememberMessage(msg.ID) {
+		s.logger.Debug("chat: dropping redelivered message", "message_id", msg.ID, "user_id", msg.AuthorID)
+		return
+	}
 
 	content := strings.TrimSpace(msg.Text)
 	safeContent, verdict := ioscan.EnforceInput(content)
@@ -57,6 +61,9 @@ func (s *Service) routeMessage(ctx context.Context, msg Message) {
 		return
 	}
 	content = safeContent
+	// The author is set before the plain-reply branch so a bare `approve` /
+	// `reject` records the same persona decision signal as `!runs approve`.
+	ctx = context.WithValue(ctx, commandAuthorContextKey{}, msg.AuthorID)
 	if !strings.HasPrefix(content, "!") {
 		if s.handlePendingCheckpointReply(ctx, msg, content) {
 			return
@@ -79,16 +86,17 @@ func (s *Service) routeMessage(ctx context.Context, msg Message) {
 	if len(s.allowedUsers) == 0 {
 		s.logger.Warn("discord: ignoring command — allowlist is empty (commands disabled; set allowed_users to enable)",
 			"user_id", msg.AuthorID, "content", content)
+		s.enqueue(unauthorizedCommandReply(msg.AuthorID))
 		return
 	}
 	role, ok := s.allowedUsers[msg.AuthorID]
 	if !ok {
 		s.logger.Warn("discord: ignoring command from non-allowlisted user",
 			"user_id", msg.AuthorID, "content", content)
+		s.enqueue(unauthorizedCommandReply(msg.AuthorID))
 		return
 	}
 	ctx = context.WithValue(ctx, commandRoleContextKey{}, role)
-	ctx = context.WithValue(ctx, commandAuthorContextKey{}, msg.AuthorID)
 
 	content = content[1:]
 
@@ -147,6 +155,13 @@ func (s *Service) routeMessage(ctx context.Context, msg Message) {
 	}
 
 	s.enqueue(fmt.Sprintf("❌ Unknown command: `%s`. Try `!help`", cmd))
+}
+
+// unauthorizedCommandReply is the fixed refusal for a command from an author
+// outside the allowlist, so a dropped command is never silent. It never
+// echoes the command text.
+func unauthorizedCommandReply(author string) string {
+	return fmt.Sprintf("❌ `%s` is not authorized to run chat commands (not in the chat allowlist).", strings.ReplaceAll(author, "`", ""))
 }
 
 func (s *Service) isValidAgent(name string) bool {

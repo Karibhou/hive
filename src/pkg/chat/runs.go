@@ -466,11 +466,35 @@ func (s *Service) diffRuns(prev, cur []runSnapshot) {
 		}
 		if run.WaitingOn != "human" {
 			s.clearPendingCheckpoint(run.Key)
+			if existed && old.WaitingOn == "human" {
+				s.forgetRunMarks(run.Key)
+			}
 		}
 	}
 	for key, old := range prevMap {
-		if _, ok := curMap[key]; !ok && old.WaitingOn == "human" {
-			s.clearPendingCheckpoint(key)
+		if _, ok := curMap[key]; !ok {
+			if old.WaitingOn == "human" {
+				s.clearPendingCheckpoint(key)
+			}
+			s.forgetRunMarks(key)
+		}
+	}
+}
+
+// forgetRunMarks drops every author's persona summary marks for a run once it
+// leaves the pending set or the run list, so marks for authors who never
+// decided do not accumulate for the process lifetime.
+func (s *Service) forgetRunMarks(runKey string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key := range s.expandedRuns {
+		if key.runKey == runKey {
+			delete(s.expandedRuns, key)
+		}
+	}
+	for key := range s.shownSummaries {
+		if key.runKey == runKey {
+			delete(s.shownSummaries, key)
 		}
 	}
 }

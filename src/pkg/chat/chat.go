@@ -21,6 +21,7 @@ const (
 	defaultSendInterval      = 1200 * time.Millisecond
 	defaultHeartbeatInterval = 15 * time.Minute
 	defaultMessageLimit      = 1900
+	seenMessageCacheSize     = 512
 )
 
 // AgentIdentity holds the chat display metadata for an agent.
@@ -153,6 +154,10 @@ type Service struct {
 	// persona signals are derived from; see persona_learning.go.
 	expandedRuns   map[personaRunKey]struct{}
 	shownSummaries map[personaRunKey]struct{}
+	// seenMessages/seenOrder are a bounded window of inbound Message.IDs so a
+	// backend redelivery (e.g. a Slack Socket Mode retry) never runs twice.
+	seenMessages map[string]struct{}
+	seenOrder    []string
 }
 
 type msgItem struct {
@@ -208,7 +213,28 @@ func NewService(backend Backend, cfg Config, logger *slog.Logger) *Service {
 		pendingCheckpoints: make(map[pendingCheckpointKey]*pendingCheckpoint),
 		expandedRuns:       make(map[personaRunKey]struct{}),
 		shownSummaries:     make(map[personaRunKey]struct{}),
+		seenMessages:       make(map[string]struct{}),
 	}
+}
+
+// rememberMessage records an inbound message ID and reports whether it is
+// new. Empty IDs are never deduped.
+func (s *Service) rememberMessage(id string) bool {
+	if id == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seenMessages[id]; ok {
+		return false
+	}
+	s.seenMessages[id] = struct{}{}
+	s.seenOrder = append(s.seenOrder, id)
+	if len(s.seenOrder) > seenMessageCacheSize {
+		delete(s.seenMessages, s.seenOrder[0])
+		s.seenOrder = s.seenOrder[1:]
+	}
+	return true
 }
 
 func parseAllowedUser(entry string, index int) (string, string) {
