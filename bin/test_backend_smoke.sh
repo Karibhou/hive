@@ -29,7 +29,9 @@
 #      B0 detect_cli health probe (contributor-agent.sh's own seam);
 #      B1 headless end-to-end: real relay, real CLI one-shot, fake hub;
 #      B2 interactive end-to-end: real CLI in tmux, the relay scraping the
-#         pane — the exact surface the thirteen chrome issues lived on.
+#         pane — the exact surface the thirteen chrome issues lived on;
+#      B3 (codex) task-sized prompt delivery (#9078): the real CLI must
+#         record exactly one turn carrying the ~6.8 KB prompt byte for byte.
 #
 # Env knobs:
 #   HIVE_SMOKE_BACKENDS              space-separated, default "claude codex"
@@ -788,6 +790,103 @@ if [ "$RIG_OK" = "1" ]; then
       continue
     fi
 
+    # interactive_round LABEL PROMPT — one real-CLI interactive task: a fresh
+    # tmux pane, the same launch line contributor-agent.sh types, the
+    # first-run auto-dismiss loop, the real relay against a fake hub serving
+    # PROMPT, and the common assertions (task_complete, completion_signal
+    # verdict, the verdict on the wire). Leaves HUB_LOG/RELAY_LOG/TMUX_SESS
+    # set and the scenario RUNNING so the caller can add checks before
+    # stop_scenario. Returns 0 when the task completed.
+    interactive_round() {
+      local label="$1" prompt="$2" completed=1
+      TMUX_SESS="hive-smoke-$b-$label"
+      tmux kill-session -t "$TMUX_SESS" 2>/dev/null
+      if SMOKE_PROMPT="$prompt" start_fakehub "$label-$b" && tmux new-session -d -s "$TMUX_SESS" -x 200 -y 50 -c "$WORK/ws-$b"; then
+        CMD="$(backend_binary "$b")"
+        PERM_FLAG="$(backend_perm_flag_shell "$b")"
+        MODEL_FLAG=""
+        case "$b" in goose|bob) ;; *) [ -n "$model" ] && MODEL_FLAG="--model $model" ;; esac
+        # Same launch line contributor-agent.sh types, into the same kind of
+        # fresh-HOME pane a new contributor gets.
+        tmux send-keys -t "$TMUX_SESS" \
+          "cd $(printf %q "$WORK/ws-$b") && HOME=$(printf %q "$bhome") CODEX_HOME=$(printf %q "$bhome/.codex") $CMD $PERM_FLAG $MODEL_FLAG" Enter
+
+        # contributor-agent.sh's auto-dismiss loop, abbreviated: first-run
+        # trust/theme/API-key dialogs must be cleared for readiness to be
+        # reachable at all — their patterns going stale is itself a drift
+        # failure this scenario would surface as a readiness timeout.
+        (
+          for _ in $(seq 1 10); do
+            sleep 3
+            PANE="$(tmux capture-pane -t "$TMUX_SESS" -p -S -10 2>/dev/null || true)"
+            if echo "$PANE" | grep -q "trust this folder\|trust the files\|Confirm folder trust\|Enter to confirm"; then
+              tmux send-keys -t "$TMUX_SESS" Enter 2>/dev/null || true
+            elif echo "$PANE" | grep -q "Do you trust the contents of this directory"; then
+              tmux send-keys -t "$TMUX_SESS" "1" Enter 2>/dev/null || true
+            elif echo "$PANE" | grep -q "Choose the text style"; then
+              tmux send-keys -t "$TMUX_SESS" "1" Enter 2>/dev/null || true
+            elif echo "$PANE" | grep -q "Bypass Permissions mode"; then
+              # Fallback only — the settings seed suppresses this menu. Its
+              # default selection is "No, exit", so a bare Enter kills the CLI.
+              tmux send-keys -t "$TMUX_SESS" "2" Enter 2>/dev/null || true
+            elif echo "$PANE" | grep -qi "custom API key"; then
+              tmux send-keys -t "$TMUX_SESS" "1" Enter 2>/dev/null || true
+            elif echo "$PANE" | grep -q "bypass permissions\|❯\|›\|/ commands\|> *$"; then
+              break
+            fi
+          done
+        ) &
+        DISMISS_PID=$!
+
+        RELAY_LOG="$WORK/relay-$b-interactive-$label.log"
+        (
+          cd "$ROOT" || exit 1
+          HOME="$bhome" \
+          CODEX_HOME="$bhome/.codex" \
+          AGENT_BACKEND="$b" \
+          AGENT_MODEL="$model" \
+          HIVE_AGENT_SESSION="$TMUX_SESS" \
+          HIVE_AGENT_CWD="$WORK/ws-$b" \
+          HIVE_HUB="ws://127.0.0.1:$HUB_PORT/contribute" \
+          HIVE_REGISTRATION_TOKEN=smoke-token \
+          HIVE_WORKSPACE_DIR="$WORK/ws-$b" \
+          HIVE_TASK_FILE="$WORK/task-$b-$label.json" \
+          HIVE_GH_TOKEN_CACHE="$WORK/gh-$b-$label.cache" \
+          exec node "$RELAY"
+        ) >"$RELAY_LOG" 2>&1 &
+        RELAY_PID=$!
+
+        # The interactive completion check runs on the relay's 120s progress
+        # tick, so the floor here is ~2.5 minutes even for an instant reply.
+        if wait_for_terminal "$HUB_LOG" 480; then
+          if msg_seen "$HUB_LOG" task_complete; then
+            completed=0
+            sig="$(msg_field "$HUB_LOG" task_complete .completion_signal)"
+            if [ "$sig" = "verdict" ]; then
+              pass "[$label] completion_signal=verdict — the $b CLI honored the sentinel contract"
+            else
+              fail "[$label] completion_signal=verdict — the $b CLI honored the sentinel contract" \
+                   "got '$sig': the task completed but only the chrome-idle fallback saved it; the HIVE_VERDICT contract is broken for $b"
+              dump_evidence "$label-$b" "$RELAY_LOG"
+            fi
+            check "[$label] verdict on the wire" "no_work_needed" \
+                  "$(msg_field "$HUB_LOG" task_complete .verdict)"
+          else
+            fail "[$label] interactive run completed" \
+                 "task_failed: $(msg_field "$HUB_LOG" task_failed .reason)"
+            dump_evidence "$label-$b" "$RELAY_LOG"
+          fi
+        else
+          fail "[$label] interactive run reached a terminal message within 480s (readiness regexes may no longer match the real $b pane)"
+          dump_evidence "$label-$b" "$RELAY_LOG"
+        fi
+        kill "$DISMISS_PID" 2>/dev/null
+      else
+        fail "fake hub + tmux session started ($label-$b)"
+      fi
+      return $completed
+    }
+
     echo ""
     echo "-- B2 [$b]: interactive end-to-end (tmux pane, completion_signal) --"
     # The drift surface: readiness regexes against a REAL current pane,
@@ -796,91 +895,50 @@ if [ "$RIG_OK" = "1" ]; then
     # completed only because the fallback saved it: the sentinel contract is
     # broken for this backend and the fleet is one chrome restyle away from
     # the next #4127.
-    TMUX_SESS="hive-smoke-$b"
-    tmux kill-session -t "$TMUX_SESS" 2>/dev/null
-    if start_fakehub "b2-$b" && tmux new-session -d -s "$TMUX_SESS" -c "$WORK/ws-$b"; then
-      CMD="$(backend_binary "$b")"
-      PERM_FLAG="$(backend_perm_flag_shell "$b")"
-      MODEL_FLAG=""
-      case "$b" in goose|bob) ;; *) [ -n "$model" ] && MODEL_FLAG="--model $model" ;; esac
-      # Same launch line contributor-agent.sh types, into the same kind of
-      # fresh-HOME pane a new contributor gets.
-      tmux send-keys -t "$TMUX_SESS" \
-        "cd $(printf %q "$WORK/ws-$b") && HOME=$(printf %q "$bhome") CODEX_HOME=$(printf %q "$bhome/.codex") $CMD $PERM_FLAG $MODEL_FLAG" Enter
+    interactive_round b2 "$SMOKE_PROMPT" || true
+    stop_scenario
 
-      # contributor-agent.sh's auto-dismiss loop, abbreviated: first-run
-      # trust/theme/API-key dialogs must be cleared for readiness to be
-      # reachable at all — their patterns going stale is itself a drift
-      # failure this scenario would surface as a readiness timeout.
-      (
-        for _ in $(seq 1 10); do
-          sleep 3
-          PANE="$(tmux capture-pane -t "$TMUX_SESS" -p -S -10 2>/dev/null || true)"
-          if echo "$PANE" | grep -q "trust this folder\|trust the files\|Confirm folder trust\|Enter to confirm"; then
-            tmux send-keys -t "$TMUX_SESS" Enter 2>/dev/null || true
-          elif echo "$PANE" | grep -q "Do you trust the contents of this directory"; then
-            tmux send-keys -t "$TMUX_SESS" "1" Enter 2>/dev/null || true
-          elif echo "$PANE" | grep -q "Choose the text style"; then
-            tmux send-keys -t "$TMUX_SESS" "1" Enter 2>/dev/null || true
-          elif echo "$PANE" | grep -q "Bypass Permissions mode"; then
-            # Fallback only — the settings seed suppresses this menu. Its
-            # default selection is "No, exit", so a bare Enter kills the CLI.
-            tmux send-keys -t "$TMUX_SESS" "2" Enter 2>/dev/null || true
-          elif echo "$PANE" | grep -qi "custom API key"; then
-            tmux send-keys -t "$TMUX_SESS" "1" Enter 2>/dev/null || true
-          elif echo "$PANE" | grep -q "bypass permissions\|❯\|›\|/ commands\|> *$"; then
-            break
-          fi
-        done
-      ) &
-      DISMISS_PID=$!
-
-      RELAY_LOG="$WORK/relay-$b-interactive.log"
-      (
-        cd "$ROOT" || exit 1
-        HOME="$bhome" \
-        CODEX_HOME="$bhome/.codex" \
-        AGENT_BACKEND="$b" \
-        AGENT_MODEL="$model" \
-        HIVE_AGENT_SESSION="$TMUX_SESS" \
-        HIVE_AGENT_CWD="$WORK/ws-$b" \
-        HIVE_HUB="ws://127.0.0.1:$HUB_PORT/contribute" \
-        HIVE_REGISTRATION_TOKEN=smoke-token \
-        HIVE_WORKSPACE_DIR="$WORK/ws-$b" \
-        HIVE_TASK_FILE="$WORK/task-$b.json" \
-        HIVE_GH_TOKEN_CACHE="$WORK/gh-$b.cache" \
-        exec node "$RELAY"
-      ) >"$RELAY_LOG" 2>&1 &
-      RELAY_PID=$!
-
-      # The interactive completion check runs on the relay's 120s progress
-      # tick, so the floor here is ~2.5 minutes even for an instant reply.
-      if wait_for_terminal "$HUB_LOG" 480; then
-        if msg_seen "$HUB_LOG" task_complete; then
-          sig="$(msg_field "$HUB_LOG" task_complete .completion_signal)"
-          if [ "$sig" = "verdict" ]; then
-            pass "completion_signal=verdict — the $b CLI honored the sentinel contract"
-          else
-            fail "completion_signal=verdict — the $b CLI honored the sentinel contract" \
-                 "got '$sig': the task completed but only the chrome-idle fallback saved it; the HIVE_VERDICT contract is broken for $b"
-            dump_evidence "B2-$b" "$RELAY_LOG"
-          fi
-          check "verdict on the wire" "no_work_needed" \
-                "$(msg_field "$HUB_LOG" task_complete .verdict)"
+    if [ "$b" = "codex" ]; then
+      echo ""
+      echo "-- B3 [$b]: task-sized prompt is delivered whole and starts exactly one turn (#9078) --"
+      # The seam #9078 broke, against the REAL CLI: a ~6.8 KB prompt (the
+      # size the issue reproduced with, on the 200×50 pane the contributor
+      # image runs) must reach codex as ONE bracketed paste and start ONE
+      # turn. The B2 prompt above is the short control the issue reports as
+      # working with either transport; this one is the size that did not.
+      # Exactly-once and full-length delivery are read from codex's own
+      # session rollout under the throwaway CODEX_HOME — the user message it
+      # recorded is what the model was actually given — not from the pane.
+      # Trailing whitespace is avoided so codex's default trim_submission
+      # cannot change the text; the comparison below is byte-for-byte, not a
+      # length, so the locale's idea of a character never enters into it.
+      LONG_SMOKE_PROMPT="$SMOKE_PROMPT Inert padding, ignore it:$(node -e "process.stdout.write(' padding'.repeat(850))")"
+      if interactive_round b3-long "$LONG_SMOKE_PROMPT"; then
+        contains "[b3-long] the relay delivered the prompt as a bracketed paste" \
+                 "$(cat "$RELAY_LOG")" "Task prompt sent to CLI (bracketed paste,"
+        contains "[b3-long] the relay saw codex start the turn" \
+                 "$(cat "$RELAY_LOG")" "Task prompt delivery: started"
+        # codex rollout lines carry the submitted prompt as either an
+        # event_msg/user_message or a response_item user message; take both
+        # shapes so a format shift in one does not read as a lost prompt.
+        user_msgs="$(find "$bhome/.codex/sessions" -name '*.jsonl' -type f 2>/dev/null | xargs -r cat 2>/dev/null | jq -r '
+          if .type == "event_msg" and .payload.type == "user_message" then .payload.message
+          elif .type == "response_item" and .payload.type == "message" and .payload.role == "user"
+            then ([.payload.content[]? | select(.type == "input_text") | .text] | join(""))
+          else empty end' 2>/dev/null | grep -F 'Inert padding, ignore it:' || true)"
+        if [ -z "$user_msgs" ]; then
+          skip "[b3-long] codex recorded no user message for this prompt under $bhome/.codex/sessions — exactly-once cannot be read from the rollout (format drift?); the relay-side checks above stand"
         else
-          fail "interactive run completed" \
-               "task_failed: $(msg_field "$HUB_LOG" task_failed .reason)"
-          dump_evidence "B2-$b" "$RELAY_LOG"
+          check "[b3-long] codex recorded exactly one turn for the prompt" "1" \
+                "$(printf '%s\n' "$user_msgs" | wc -l | tr -d ' ')"
+          check "[b3-long] the recorded turn is the whole prompt, byte for byte" "true" \
+                "$(printf '%s' "$user_msgs" | head -n1 | jq -R --arg p "$LONG_SMOKE_PROMPT" '. == $p')"
         fi
       else
-        fail "interactive run reached a terminal message within 480s (readiness regexes may no longer match the real $b pane)"
-        dump_evidence "B2-$b" "$RELAY_LOG"
+        dump_evidence "B3-$b" "$RELAY_LOG"
       fi
-      kill "$DISMISS_PID" 2>/dev/null
-    else
-      fail "fake hub + tmux session started (B2-$b)"
+      stop_scenario
     fi
-    stop_scenario
   done
 fi
 
