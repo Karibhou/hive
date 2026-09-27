@@ -38,6 +38,10 @@ func (s *Server) handleContributeMCP(w http.ResponseWriter, r *http.Request) {
 		r, leaseOK = s.authenticateTaskMCPLaunch(r)
 	}
 	if !leaseOK && !s.authorizeTaskMCP(r) {
+		if s.isQueryDashboardToken(r) {
+			writeQueryTokenRejected(w, r)
+			return
+		}
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -48,7 +52,7 @@ func (s *Server) authorizeTaskMCP(r *http.Request) bool {
 	if s == nil || strings.TrimSpace(s.authToken) == "" {
 		return false
 	}
-	token := bearerToken(r)
+	token := bearerHeaderToken(r)
 	return secureCompare(token, s.authToken)
 }
 
