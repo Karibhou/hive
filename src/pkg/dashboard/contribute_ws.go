@@ -3028,6 +3028,9 @@ func (h *ContributeWSHub) QualifiedStandbyCounts(lanes []string, laneItems map[s
 	for _, lane := range lanes {
 		agentCfg := cfg.Agents[lane]
 		standbyCfg := agentCfg.Standby
+		if standbyCfg == nil || !standbyCfg.IsStandbyEnabled() {
+			continue
+		}
 		policy := standbypkg.LanePolicy{
 			Floor:    standbypkg.NormalizeTier(standbyCfg.StandbyFloor()),
 			DailyCap: standbyCfg.StandbyDailyCap(),
