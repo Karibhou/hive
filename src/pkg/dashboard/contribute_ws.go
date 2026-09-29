@@ -981,12 +981,14 @@ type ContributeWSHub struct {
 	// EXPIRING before the next dispatch, so this must survive that sweep.
 	// Guarded by completedMu; persisted in the same PVC-backed ledger dir as
 	// the cooldowns so a pod restart does not forget the verdict.
-	noWorkVerdicts     map[string]noWorkVerdictRecord
-	standbyOutcomes    []standbyOutcomeRecord
-	activityFilePath   string
-	completedTasksFile string
-	failedTasksFile    string
-	noPRStreaksFile    string
+	noWorkVerdicts         map[string]noWorkVerdictRecord
+	standbyReconcileCancel context.CancelFunc
+	standbyReconcileDone   chan struct{}
+	standbyOutcomes        []standbyOutcomeRecord
+	activityFilePath       string
+	completedTasksFile     string
+	failedTasksFile        string
+	noPRStreaksFile        string
 	// taskLeasesFile is where the server-issued lease registry is persisted so it
 	// survives a hub restart (#5681). Overridable per hub for tests, like the
 	// sibling ledgers.
@@ -1005,6 +1007,15 @@ type ContributeWSHub struct {
 	persistActivity     bool
 	persistTaskLedgers  bool
 	completedMu         sync.Mutex
+	// standbyReconcileMu serializes reconcileOpenStandbyOutcomes (#9184): two
+	// reconciles that both snapshot a still-open PR before either appends would
+	// each record its closure, and one closed PR would count twice toward the
+	// suspend rule. Taken before completedMu, never while holding it.
+	standbyReconcileMu sync.Mutex
+	// standbyOutcomesSaveMu spans saveStandbyOutcomes' snapshot→rename (#9184),
+	// so a later save always writes a snapshot at least as new as an earlier
+	// one. Taken before completedMu, never while holding it.
+	standbyOutcomesSaveMu sync.Mutex
 	// standbyDispatches records manual donated dispatches inside the rolling
 	// standby daily-cap window. The cap decrements at dispatch, not completion,
 	// so abandoned donated work still consumes a slot.
@@ -1180,6 +1191,10 @@ func NewContributeWSHub(logger *slog.Logger, server *Server) *ContributeWSHub {
 	// reconnect, so an in-flight task survives the restart instead of being revoked
 	// out from under a working agent.
 	hub.loadLeases()
+	standbyCtx, standbyCancel := context.WithCancel(context.Background())
+	hub.standbyReconcileCancel = standbyCancel
+	hub.standbyReconcileDone = make(chan struct{})
+	go hub.standbyReconcileLoop(standbyCtx)
 	go hub.cleanupLoop()
 	return hub
 }
@@ -4610,29 +4625,7 @@ func (h *ContributeWSHub) cleanupLoop() {
 		case <-h.stopCh:
 			return
 		case <-ticker.C:
-			// #2568: reclaim wedged-but-connected task leases first (the backstop). A
-			// connection whose lastPong is still fresh (so the heartbeat sweep below will
-			// NOT remove it) but that has stopped renewing its task lease is exactly the
-			// "connected but wedged" case the issue describes; this releases its task
-			// through the SAME cooldown+generation-bump path a manual requeue uses.
-			h.reclaimExpiredLeases(time.Now())
-
-			// #8303: drive the installed stage runner (advance on final, retry or
-			// escalate on expiry). Nothing is installed unless
-			// runs.spektacular.enabled was set at boot.
-			if h.server != nil {
-				h.server.tickStageRunner(time.Now())
-			}
-
-			// A run stage waiting on a taker must outlive leaseTTL; extend those
-			// BEFORE the prune below can drop them.
-			h.keepPendingStageLeasesAlive(time.Now())
-
-			// #5681: drop leases that aged out without ever being looked up — a relay
-			// that never came back after a restart leaves one behind, and it would
-			// otherwise keep its issue out of the assignment pool until the process
-			// ended.
-			h.pruneExpiredLeases(time.Now())
+			h.tickLeaseLifecycle(time.Now())
 
 			// #8380: lapse worker claims on the same cadence so their GitHub
 			// labels come off and the issue returns to the offer pool.
@@ -4685,6 +4678,35 @@ func (h *ContributeWSHub) cleanupLoop() {
 	}
 }
 
+// tickLeaseLifecycle is the lease half of one cleanupLoop tick, in the order
+// the loop has always run it. It is a method so tests drive the exact
+// production order rather than a hand-copied one (#9143).
+func (h *ContributeWSHub) tickLeaseLifecycle(now time.Time) {
+	// #2568: reclaim wedged-but-connected task leases first (the backstop). A
+	// connection whose lastPong is still fresh (so the heartbeat sweep will NOT
+	// remove it) but that has stopped renewing its task lease is exactly the
+	// "connected but wedged" case the issue describes; this releases its task
+	// through the SAME cooldown+generation-bump path a manual requeue uses.
+	h.reclaimExpiredLeases(now)
+
+	// #8303: drive the installed hub executor (launch, then retry or escalate
+	// a spent generation, #9143) and stage runner (advance on final). Nothing
+	// is installed unless runs.spektacular.enabled was set at boot.
+	if h.server != nil {
+		h.server.tickStageRunner(now)
+	}
+
+	// A run stage waiting on a taker must outlive leaseTTL; extend those
+	// BEFORE the prune below can drop them.
+	h.keepPendingStageLeasesAlive(now)
+
+	// #5681: drop leases that aged out without ever being looked up — a relay
+	// that never came back after a restart leaves one behind, and it would
+	// otherwise keep its issue out of the assignment pool until the process
+	// ended.
+	h.pruneExpiredLeases(now)
+}
+
 // Close terminates the hub's background cleanup loop and blocks until it
 // exits. It is safe to call concurrently and multiple times (idempotent).
 func (h *ContributeWSHub) Close() {
@@ -4692,12 +4714,18 @@ func (h *ContributeWSHub) Close() {
 		return
 	}
 	h.stopOnce.Do(func() {
+		if h.standbyReconcileCancel != nil {
+			h.standbyReconcileCancel()
+		}
 		if h.stopCh != nil {
 			close(h.stopCh)
 		}
 	})
 	if h.doneCh != nil {
 		<-h.doneCh
+	}
+	if h.standbyReconcileDone != nil {
+		<-h.standbyReconcileDone
 	}
 }
 

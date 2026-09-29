@@ -81,17 +81,20 @@ type Client struct {
 	// mergePolicyMu guards the merge-request watcher policy knobs below.
 	// Config reloads may replace them while a watcher tick is evaluating a
 	// request, so reads must be synchronized.
-	mergePolicyMu              sync.RWMutex
-	allowUnprotectedBaseRepos  map[string]bool
-	noCIAllowedRepos           map[string]bool
-	baseBranchProtectionCached map[string]baseBranchProtectionCacheEntry
-	logger                     *slog.Logger
-	appAuth                    *AppAuth // nil for token-authenticated clients
-	canariesEnabled            bool
-	canaryFailClosed           bool
-	canaryRegistry             *ioscan.CanaryRegistry
-	canaryLeakFunc             func(ioscan.CanaryLeak)
-	appBotLogin                string // "<app-slug>[bot]" when the client authenticates as a GitHub App
+	mergePolicyMu             sync.RWMutex
+	allowUnprotectedBaseRepos map[string]bool
+	noCIAllowedRepos          map[string]bool
+	mergeAlertMu              sync.Mutex
+	mergeAlertSink            MergeFailureAlertSink
+	mergeAlertIDsByRepo       map[string]map[string]mergeAlertEntry
+	mergeAlertLastRevalidate  time.Time
+	logger                    *slog.Logger
+	appAuth                   *AppAuth // nil for token-authenticated clients
+	canariesEnabled           bool
+	canaryFailClosed          bool
+	canaryRegistry            *ioscan.CanaryRegistry
+	canaryLeakFunc            func(ioscan.CanaryLeak)
+	appBotLogin               string // "<app-slug>[bot]" when the client authenticates as a GitHub App
 	// approvalDesk is the RFC #4000 approval-desk consultation performed per PR
 	// by the self-authored auto-merge sweep. nil (the default) means the sweep
 	// behaves exactly as it did before the desk existed. Set by SetApprovalDesk
@@ -108,6 +111,19 @@ type Client struct {
 	// false → no comment is fetched, no Issue carries claim fields. Read live
 	// so a Features-panel toggle applies without a client rebuild.
 	issueClaims func() (enabled bool, ttl time.Duration)
+	// mttrIssueCache remembers issue creation times used by the MTTR dashboard
+	// card so the hourly metrics pass does not refetch the same referenced issue
+	// every cycle. Guarded by mttrIssueMu.
+	mttrIssueCache map[string]mttrIssueCacheEntry
+	mttrIssueMu    sync.Mutex
+	// attributedClosedPRCache keeps the last successful bounded closed-PR
+	// attribution scan per repo. Closed attributions feed outcome/rework
+	// dashboards; they must not be re-fetched from all history each tick, and a
+	// transient closed-PR listing failure must not erase the repo's open PRs
+	// from the governor.
+	attributedClosedPRMu     sync.Mutex
+	attributedClosedPRCache  map[string]attributedClosedPRCacheEntry
+	attributedClosedPRErrors map[string]string
 	// issueClaimCache remembers the claim read for an issue at a given
 	// updated_at, so the per-issue comment fetch happens once per activity
 	// change rather than once per enumeration. Guarded by issueClaimMu.
@@ -796,7 +812,21 @@ var PermanentExemptLabels = []string{"do-not-merge"}
 // exists so a nil or unconfigured client still has a sane value.
 const AutoMergeQueuedLabel = "lgtm"
 
-const slaThresholdMinutes = 30
+const (
+	slaThresholdMinutes = 30
+
+	attributedClosedPRLookbackEnv = "HIVE_ATTRIBUTED_CLOSED_PR_LOOKBACK"
+	// attributedClosedPRDefaultLookback covers dashboard outcome/rework
+	// attribution for recent agent PRs without re-walking a repository's entire
+	// closed-PR history on every enumeration tick.
+	attributedClosedPRDefaultLookback = 14 * 24 * time.Hour
+	attributedClosedPRMaxPages        = 5
+)
+
+type attributedClosedPRCacheEntry struct {
+	prs     []PullRequest
+	fetched time.Time
+}
 
 // NewClient creates a GitHub API client. If apiURL is non-empty and differs
 // from the default (https://api.github.com), the client's BaseURL and
@@ -1333,7 +1363,8 @@ func (c *Client) fetchPRs(ctx context.Context, repo string) (actionable []PullRe
 	attributed = append(attributed, collectAttributedPRsFromList(repo, allPRs)...)
 	closed, err := c.fetchAttributedClosedPRs(ctx, owner, repoName, repo)
 	if err != nil {
-		return nil, nil, nil, nil, nil, 0, RepoPRBreakdown{}, err
+		c.warnAttributedClosedPRScan(repo, owner, repoName, err)
+		closed = c.cachedAttributedClosedPRs(repo)
 	}
 	attributed = append(attributed, closed...)
 	c.enrichAttributedPRRework(ctx, attributed)
@@ -1358,23 +1389,112 @@ func collectAttributedPRsFromList(repo string, prs []*gh.PullRequest) []PullRequ
 }
 
 func (c *Client) fetchAttributedClosedPRs(ctx context.Context, owner, repoName, repo string) ([]PullRequest, error) {
+	lookback := attributedClosedPRLookback()
+	cutoff := time.Now().Add(-lookback)
 	opts := &gh.PullRequestListOptions{
 		State:       "closed",
+		Sort:        "updated",
+		Direction:   "desc",
 		ListOptions: gh.ListOptions{PerPage: 100},
 	}
 	var out []PullRequest
-	for {
+	for page := 0; page < attributedClosedPRMaxPages; page++ {
 		prs, resp, err := c.client.PullRequests.List(ctx, owner, repoName, opts)
 		if err != nil {
 			return nil, fmt.Errorf("listing closed PRs for %s/%s: %w", owner, repoName, err)
 		}
-		out = append(out, collectAttributedPRsFromList(repo, prs)...)
-		if resp.NextPage == 0 {
+		pastWindow := false
+		for _, pr := range prs {
+			if pr == nil {
+				continue
+			}
+			if pr.GetUpdatedAt().Time.Before(cutoff) {
+				pastWindow = true
+				break
+			}
+			if meta, ok := ParseAttributionTrailer(pr.GetBody()); ok {
+				out = append(out, pullRequestAttributionRecord(repo, pr, meta))
+			}
+		}
+		if pastWindow || resp == nil || resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
+	c.storeAttributedClosedPRs(repo, out)
 	return out, nil
+}
+
+func attributedClosedPRLookback() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(attributedClosedPRLookbackEnv))
+	if raw == "" {
+		return attributedClosedPRDefaultLookback
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if strings.HasSuffix(raw, "d") {
+		if days, err := strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(raw, "d"))); err == nil && days > 0 {
+			return time.Duration(days) * 24 * time.Hour
+		}
+	}
+	if days, err := strconv.Atoi(raw); err == nil && days > 0 {
+		return time.Duration(days) * 24 * time.Hour
+	}
+	return attributedClosedPRDefaultLookback
+}
+
+func (c *Client) storeAttributedClosedPRs(repo string, prs []PullRequest) {
+	if c == nil {
+		return
+	}
+	c.attributedClosedPRMu.Lock()
+	defer c.attributedClosedPRMu.Unlock()
+	if c.attributedClosedPRCache == nil {
+		c.attributedClosedPRCache = map[string]attributedClosedPRCacheEntry{}
+	}
+	c.attributedClosedPRCache[repo] = attributedClosedPRCacheEntry{
+		prs:     append([]PullRequest(nil), prs...),
+		fetched: time.Now(),
+	}
+	if c.attributedClosedPRErrors != nil {
+		delete(c.attributedClosedPRErrors, repo)
+	}
+}
+
+func (c *Client) cachedAttributedClosedPRs(repo string) []PullRequest {
+	if c == nil {
+		return nil
+	}
+	c.attributedClosedPRMu.Lock()
+	defer c.attributedClosedPRMu.Unlock()
+	entry, ok := c.attributedClosedPRCache[repo]
+	if !ok {
+		return nil
+	}
+	return append([]PullRequest(nil), entry.prs...)
+}
+
+func (c *Client) warnAttributedClosedPRScan(repo, owner, repoName string, err error) {
+	if c == nil {
+		return
+	}
+	msg := err.Error()
+	shouldLog := true
+	c.attributedClosedPRMu.Lock()
+	if c.attributedClosedPRErrors == nil {
+		c.attributedClosedPRErrors = map[string]string{}
+	}
+	if c.attributedClosedPRErrors[repo] == msg {
+		shouldLog = false
+	} else {
+		c.attributedClosedPRErrors[repo] = msg
+	}
+	c.attributedClosedPRMu.Unlock()
+	if shouldLog && c.logger != nil {
+		c.logger.Warn("closed PR attribution scan failed; keeping open PR enumeration and last-good closed attributions",
+			"repo", repo, "github_repo", owner+"/"+repoName, "error", err)
+	}
 }
 
 func pullRequestAttributionRecord(repo string, pr *gh.PullRequest, meta InvocationMeta) PullRequest {
@@ -1458,7 +1578,7 @@ func (c *Client) enrichPRCI(ctx context.Context, pr *PullRequest) map[string]boo
 	// "mergeable"/"mergeable_state" — GitHub computes them per-PR and
 	// returns them only from this single-PR GET. On error we leave the
 	// field as MergeableUnknown rather than guessing.
-	if full, _, err := c.client.PullRequests.Get(ctx, owner, repoName, pr.Number); err != nil {
+	if full, _, err := c.client.PullRequests.Get(WithRESTCaller(ctx, "hive:enrich_pr_ci"), owner, repoName, pr.Number); err != nil {
 		c.logger.Warn("failed to fetch PR mergeability", "repo", pr.Repo, "pr", pr.Number, "error", err)
 	} else {
 		pr.Mergeable = mergeableFromState(full.GetMergeableState(), full.Mergeable)
@@ -1473,13 +1593,14 @@ func (c *Client) enrichPRCI(ctx context.Context, pr *PullRequest) map[string]boo
 		pr.CIStatus = ciStatusPending
 		return nil
 	}
-	reported := make(map[string]bool, len(checkRuns.CheckRuns))
-	for _, cr := range checkRuns.CheckRuns {
+	latestCheckRuns := latestCheckRunsByNameAndApp(checkRuns.CheckRuns)
+	reported := make(map[string]bool, len(latestCheckRuns))
+	for _, cr := range latestCheckRuns {
 		if name := cr.GetName(); name != "" {
 			reported[name] = true
 		}
 	}
-	if checkRuns.GetTotal() == 0 {
+	if len(latestCheckRuns) == 0 {
 		pr.CIStatus = ciStatusPending
 		return reported
 	}
@@ -1488,7 +1609,7 @@ func (c *Client) enrichPRCI(ctx context.Context, pr *PullRequest) map[string]boo
 	ciChecksFound := 0
 	var failingNames []string
 	var failingIDs []int64
-	for _, cr := range checkRuns.CheckRuns {
+	for _, cr := range latestCheckRuns {
 		if isMetaCheck(cr.GetName()) {
 			continue
 		}
@@ -1707,7 +1828,7 @@ func (c *Client) GetPRAuthor(ctx context.Context, repo string, number int) (stri
 		return "", ErrNoGitHubClient
 	}
 	owner, repoName := c.splitRepo(repo)
-	pr, _, err := c.client.PullRequests.Get(ctx, owner, repoName, number)
+	pr, _, err := c.client.PullRequests.Get(WithRESTCaller(ctx, "hive:get_pr_author"), owner, repoName, number)
 	if err != nil {
 		return "", err
 	}
@@ -1730,7 +1851,7 @@ func (c *Client) GetPRState(ctx context.Context, repo string, number int) (PRSta
 		return PRState{}, ErrNoGitHubClient
 	}
 	owner, repoName := c.splitRepo(repo)
-	pr, _, err := c.client.PullRequests.Get(ctx, owner, repoName, number)
+	pr, _, err := c.client.PullRequests.Get(WithRESTCaller(ctx, "hive:get_pr_state"), owner, repoName, number)
 	if err != nil {
 		return PRState{}, err
 	}
@@ -1756,7 +1877,7 @@ func (c *Client) QueuePRAutoMerge(ctx context.Context, repo string, number int, 
 		return errors.New("queuedBy is required for auto-merge audit and self-merge checks")
 	}
 	owner, repoName := c.splitRepo(repo)
-	pr, _, err := c.client.PullRequests.Get(ctx, owner, repoName, number)
+	pr, _, err := c.client.PullRequests.Get(WithRESTCaller(ctx, "hive:queue_pr_automerge"), owner, repoName, number)
 	if err != nil {
 		return fmt.Errorf("fetching PR head for auto-merge approval: %w", err)
 	}
@@ -1995,10 +2116,19 @@ func HasHoldLabelWith(labels, extraHoldLabels []string) bool {
 	}
 	for _, label := range labels {
 		lower := strings.ToLower(label)
-		for _, sub := range holdLabels {
-			sub = strings.ToLower(strings.TrimSpace(sub))
-			if sub != "" && strings.Contains(lower, sub) {
-				return true
+		// Provenance labels (hive/<id>) are never hold labels, whatever the
+		// hive ID happens to contain. The substring rule below otherwise
+		// reads hive/hosted-...-placeHOLDer-r05x as "hold" and parks every
+		// item that hive has ever claimed: excluded from the actionable set,
+		// skipped by the automerge sweep, counted as on-hold (69 items on
+		// one spoke, 2026-09-28). CanonicalHiveHoldLabel deliberately uses
+		// the hive-pause/ prefix so hive/<id> can stay provenance-only.
+		if !isProvenanceLabel(lower) {
+			for _, sub := range holdLabels {
+				sub = strings.ToLower(strings.TrimSpace(sub))
+				if sub != "" && strings.Contains(lower, sub) {
+					return true
+				}
 			}
 		}
 		for _, exact := range exactHoldLabels {
@@ -2014,6 +2144,12 @@ func HasHoldLabelWith(labels, extraHoldLabels []string) bool {
 		}
 	}
 	return false
+}
+
+// isProvenanceLabel reports whether a (lower-cased) label is a hive/<id>
+// provenance marker as produced by HiveProvenanceLabel.
+func isProvenanceLabel(lower string) bool {
+	return strings.HasPrefix(lower, "hive/")
 }
 
 func isHeld(labels []string) bool { return HasHoldLabel(labels) }
@@ -2247,9 +2383,17 @@ func trackerTitlePrefix(title string) bool {
 }
 
 type RateLimitInfo struct {
-	Core    RateLimitEntry `json:"core"`
-	Search  RateLimitEntry `json:"search"`
-	GraphQL RateLimitEntry `json:"graphql"`
+	Core         RateLimitEntry `json:"core"`
+	Search       RateLimitEntry `json:"search"`
+	GraphQL      RateLimitEntry `json:"graphql"`
+	TopConsumers []RESTConsumer `json:"top_consumers,omitempty"`
+	ETagCache    ETagCacheInfo  `json:"etag_cache"`
+}
+
+type ETagCacheInfo struct {
+	Hits    int64 `json:"hits"`
+	Misses  int64 `json:"misses"`
+	Entries int64 `json:"entries"`
 }
 
 type RateLimitEntry struct {
@@ -2305,6 +2449,9 @@ func (c *Client) RateLimits(ctx context.Context) (*RateLimitInfo, error) {
 	info.Core = c.rateLimits.observe("core", info.Core)
 	info.Search = c.rateLimits.observe("search", info.Search)
 	info.GraphQL = c.rateLimits.observe("graphql", info.GraphQL)
+	hits, misses, entries := ETagCacheStats()
+	info.ETagCache = ETagCacheInfo{Hits: hits, Misses: misses, Entries: entries}
+	info.TopConsumers = RESTTopConsumers(10)
 
 	return info, nil
 }

@@ -67,16 +67,42 @@ Sync posts to `https://api.github.com/graphql` with the hive's `GITHUB_TOKEN`.
 own bearer token.
 
 Maintainers can invite Spektacular or another configured hive agent into a Jam
-thread. Agent participation is deliberately review-gated: the attributed agent
-reply is posted in-thread and any proposed spec text is created as an open
-suggestion, but a permitted human maintainer must still accept it before the
-spec revision changes.
+thread (`POST /api/campaigns/{id}/jam/agents`, handler
+`handleCampaignJamAgentsPost` in `pkg/dashboard/api_campaigns_jam_agents.go`).
+The invite makes one model call and records only what the model returned:
+
+- **Endpoint:** the hive reviewer endpoint (`governor.trajectory.endpoint`,
+  falling back to the `governor.litellm` endpoint and key) — the same
+  OpenAI-compatible `/v1/chat/completions` route the intent-alignment and
+  ioscan classifier lanes use. With no endpoint or model resolved the invite
+  fails with `503` and nothing is recorded.
+- **Model:** the invited agent's configured `agents.<name>.model`, falling back
+  to the reviewer model (`governor.trajectory.model`, then
+  `governor.litellm.default_model`). `spektacular` is not an `agents:` entry,
+  so it always uses the reviewer model. The reply is attributed to exactly the
+  model that was called. The `spektacular` binary is not run for Jam replies;
+  the name selects the persona in the prompt.
+- **Context:** the thread's section, title and last 20 comments, the current
+  spec content, and the maintainer's optional `prompt`, each bounded in size.
+  When `ioscan` is enabled every piece passes the input scanner: blocked text
+  is redacted before it reaches the model, and a critical injection at a
+  fail-closed ACMM level rejects the invite with `422`.
+- **Output:** the model must return a JSON object with `reply` and
+  `proposed_text`; invalid output is re-prompted up to three times, then the
+  invite fails with `502` and nothing is recorded.
+
+Callers cannot supply `reply`, `proposed_text` or `model` — the endpoint rejects
+them with `400`, so human-written text can never be recorded under
+agent/model attribution. Agent participation stays review-gated: the reply is
+posted in-thread, proposed spec text (when the model offers any) becomes an
+open suggestion, and a permitted human maintainer must still accept it before
+the spec revision changes.
 
 ## Enabling it
 
 ```yaml
 runs:
-  max_stage_retries: 2        # default; generations one stage may burn
+  max_stage_retries: 2        # default; generations one hub-executed stage may spend
   spektacular:
     enabled: true             # default false
     binary: spektacular       # default; resolved through PATH
@@ -87,7 +113,10 @@ runs:
 As of v6, the Hive hub/spoke image, hub image, and contributor-agent image
 ship a pinned `spektacular` release binary in `/usr/local/bin`, verified against
 the release `checksums.txt` during the image build. Operators may still override
-`runs.spektacular.binary` to point at another executable. At boot, when
+`runs.spektacular.binary` to point at another executable. The hub executor uses
+this executable for project initialization, status probes, and the commands in
+its spec/plan agent prompts. Use an absolute path for an executable outside PATH.
+At boot, when
 `runs.spektacular.enabled` is true, Hive probes `<binary> --version`, logs the
 found or missing binary, and exposes
 `spektacular: {present, version, binary, hub_executor}` in `/api/status`.
@@ -100,9 +129,16 @@ source flag. When Spektacular is enabled from the dashboard, Hive also sets
 the work-source loop. The same backward-compatible keys remain accepted by
 `PUT /api/config/governor/features` (`spektacularEnabled`,
 `spektacularBinary`, plus the newer poll/retry/triage/checkpoint fields). The
-runner is installed at boot (`cmd/hive`, `wireSpektacularRunner`), so runner
-process changes take effect on the next boot; dashboard-visible config is
-persisted immediately.
+runner is installed at boot (`cmd/hive`, `wireSpektacularRunner`) and rewired
+when a dashboard save changes `runs` config (`rewireSpektacular`, #9172): the
+binary is re-probed, the stage runner and hub executor are rebuilt from the new
+settings, and turning Spektacular off removes them. A hub executor that is
+running a stage is never swapped out from under it; the change is deferred and
+retried on every hub cleanup tick until the executor is idle. The save
+response's `spektacularApply` field reports `live`, `deferred`, or `restart`
+(nothing wired to rewire; the change takes effect on the next boot), and the
+dashboard warns on the last two. A save the config volume refuses returns 500
+rather than reporting success.
 
 Spek-enabled hives also enable the hub-resident executor by default:
 
@@ -158,8 +194,17 @@ same campaign path. The Spec checkpoint is the design-approval gate: when
 key), a final Spec parks the lease at `stage=spec`, surfaces
 `waiting_on=human` / `waiting_reason=checkpoint_enabled` in `/api/runs`, and
 requires an owner to approve or reject the `/api/runs/{key}/checkpoint` payload
-before Plan can start. Disabling the checkpoint records an `auto` approval and
-advances to Plan without a human. A final Plan import materializes child beads
+before Plan can start. Approving moves the reviewed spec generation to Plan
+first, then marks the design approved and applies the approved label/status on
+the work item. A failed label or status write does not undo or fail the
+approval: it is logged, audited as `design_signal_failed`, and recorded on the
+run's timeline. The same checkpoint holds runs admitted without a design epic
+(a triage `spec` verdict, `POST /api/runs/spec` outside design mode, nous or
+inception): their parked Spec receipt surfaces the same `waiting_on=human`
+projection, approval advances the lease to Plan and records a `stage_approval`
+timeline event, and rejection re-mints the Spec generation so the stage is
+offered again. Disabling the checkpoint records an `auto` approval, marks the
+design approved, and advances to Plan without a human. A final Plan import materializes child beads
 under the epic using the existing planning decompose path. For Spek runs,
 `runs.checkpoints.<stage>` governs the interactive checkpoints first: the absent
 key still means hold. The ACMM pack's `plan_auto_approve` applies to
@@ -255,10 +300,19 @@ Hive then keeps the same stage generation leased but marks the run
 `waiting_on=human`, `waiting_reason=interview_questions`. `GET
 /api/runs/{key}/interview` returns pending questions plus answered history, and
 owner-only `POST /api/runs/{key}/interview` accepts
-`{"answers":[{"id":"scope","answer":"..."}]}`. The dashboard Runs and Campaigns
+`{"request_id":"<from GET>","answers":[{"id":"scope","answer":"..."}]}`.
+The request ID is optional for older clients; supplying it rejects stale forms
+with HTTP 409. Identical retries for the current round return HTTP 200 without
+rewriting attribution or waking the executor again. The dashboard Runs and Campaigns
 cards show "Spek has N questions for you" with an in-app form; after submit Hive
 writes `.hive/spek-interview-answers.json`, wakes the executor, and the
-relaunched agent receives the answer JSON verbatim in its prompt. Operators who
+relaunched agent receives the answer JSON in its prompt. Answers pass through
+`ioscan.EnforceInput` under the configured input policy before storage, with
+secret-safe block auditing and fail-closed rejection where configured. Answers
+are bound to the request content and modification time, so reused question IDs
+cannot inherit previous answers. Legacy unstamped answers require resubmission.
+After the CLI returns, Hive removes the consumed request and answers, preserving
+any new round written during that launch. Operators who
 prefer the old fully headless behavior can set `runs.spektacular.interview:
 auto`.
 
@@ -341,24 +395,47 @@ id is cached for the stage and used for subsequent status/export calls.
   mtime that a `git checkout`, a reformat or a `touch` moves without anything
   having happened. Spek may also omit it entirely when no workflow
   state matches, so the parser treats an absent, `null` or empty
-  `updated_at` (and an empty `created_at` / `closed_at`) as unknown. A stale
-  stage is decided by Hive's own lease clock (the lease's expiry), never by
-  the artifact's timestamps. `TestUpdatedAtNeverDecides` in `pkg/spektacular`
-  keeps it that way.
-- A lease that lapses without `final` is retried through `retryLeaseStage`
-  (a new generation of the same stage, `lease_stage_retried` in the audit
-  log) while the budget allows. `max_stage_retries` counts generations
-  including the first: at the default of 2 the stage runs once, is retried
-  once, and the second expiry raises an escalation with `decision` severity
-  (`lease_stage_escalated` in the audit log, a `blocked` timeline event with
-  `severity=decision`). No third generation is ever minted; a person resets
-  the stage or abandons the run.
+  `updated_at` (and an empty `created_at` / `closed_at`) as unknown. Whether
+  a stage generation is spent is decided by the hub executor that ran it
+  (below), never by the artifact's timestamps. `TestUpdatedAtNeverDecides` in
+  `pkg/spektacular` keeps it that way.
+- The retry budget is owned by the hub executor, the one component that knows
+  when a generation has been spent (#9143). A generation is spent when its
+  agent CLI fails (including a failed claim, workspace preparation, or
+  post-exit status check) or exits with the document still not final — Hive
+  logs the exit/output tail at WARN and records
+  `hub_executor_cli_exited_nonfinal` or `hub_executor_failed` on the run
+  timeline. Each generation is launched exactly once, so
+  `max_stage_retries` has one meaning: the number of generations (agent
+  launches) one stage may spend, the first included. While budget remains the
+  executor mints a retry generation through `retryLeaseStage` (a new generation
+  of the same stage, `lease_stage_retried` in the audit log, a
+  `retry_generation_minted` progress event) and launches it on the next tick.
+  The generation that spends the last of the budget raises an escalation with
+  `decision` severity instead: `lease_stage_escalated` in the audit log and a
+  `blocked` timeline event with `severity=decision`, `attempts` and `budget`.
+  At the default of 2 the stage runs once, is retried once, and the second
+  spent generation escalates. No generation past the budget is ever minted.
+  The escalated lease is not dropped: it stays in `/api/runs`, kept alive like
+  every hub-held stage lease, with `waiting_on=human`,
+  `waiting_reason=stage_budget_exhausted` and `waiting_since` set to the
+  escalation, so the run-wait escalation sweep (`runs.wait_timeout_seconds`,
+  `runs.wait_severity`) routes it to the configured escalation sinks. The
+  executor never relaunches it; a person resets the stage or abandons the run.
+  The generations spent (`stage_retries`) and the escalation
+  (`stage_escalated_at`) are persisted on the lease, so a restart neither
+  refunds the budget nor relaunches an escalated stage.
+- Lease expiry never spends the budget. The cleanup loop keeps hub-held stage
+  leases alive so a run waiting on a taker never ages out, and the poll runner
+  only advances on final or refuses; it never retries or escalates. An
+  interview round waiting for a person does not spend a generation either, nor
+  does an agent exit that leaves the plan `stale` (that run is parked as
+  `stale_plan`, above). A relay-held stage whose relay vanishes is re-offered
+  at the same generation when its lease lapses; that is not a spent
+  generation.
 - The hub executor also treats a live lease already owned by its own identity as
   restartable work when no in-flight process is tracked for that lease
-  key/generation. If the agent CLI exits and the artifact is still not final,
-  Hive performs an immediate status check, logs the exit/output tail at WARN,
-  and records `hub_executor_cli_exited_nonfinal` on the run timeline instead of
-  leaving operators with only a silent lease expiry.
+  key/generation and the generation is not escalated.
 - The `implement` stage has no Spek document. The runner never polls
   it; its completion is the existing hold-gated PR flow.
 
@@ -367,10 +444,10 @@ is never polled or advanced again, a generation change (a retry, or the
 successor stage of an advance) keeps the poll pacing instead of earning an
 extra status call, and a second tick at the same instant is a no-op.
 
-A retry is the one lease mutation allowed on an expired lease: it exists
-because the generation lapsed, so the expired lease is its expected input and
-receives a fresh window under its new generation. An advance still requires a
-live lease.
+A retry names the generation it replaces and is refused if the lease has
+already moved past it, so a spent generation is settled at most once. Unlike
+an advance, a retry is also accepted on an expired lease and receives a fresh
+window under its new generation.
 
 ### Plan import
 

@@ -216,6 +216,7 @@ type runLeaseSnapshot struct {
 	number          int
 	key             string
 	leaseKey        string
+	stageRunKey     string
 	stage           string
 	gen             uint64
 	expiresAt       time.Time
@@ -229,6 +230,8 @@ type runLeaseSnapshot struct {
 	triageVerdict   string
 	triageRationale string
 	workItem        worksource.WorkItemContext
+	// stageEscalatedAt is when the stage spent its retry budget (#9143).
+	stageEscalatedAt time.Time
 }
 
 func (l runLeaseSnapshot) activityTime() time.Time {
@@ -804,6 +807,16 @@ func (s *Server) activeRuns(includeTimeline bool) ([]Run, error) {
 			run.WaitingSince = firstRunNonEmpty(interview.AskedAt, run.WaitingSince)
 			run.CurrentStep = firstRunNonEmpty(run.CurrentStep, worksource.RunWaitingReasonInterviewQuestions)
 		}
+		// A spec run admitted without a design epic has no plan snapshot to
+		// flag its checkpoint, so a parked spec receipt is the signal
+		// (hivecommons/hive#9182).
+		if run.WaitingOn != RunWaitingOnHuman && lease.stage == StageSpec {
+			if since, held := s.runCheckpointHeldSince(lease.stageRunKey, StageSpec, lease.gen); held {
+				run.WaitingOn = RunWaitingOnHuman
+				run.WaitingReason = s.runCheckpointPolicy(StageSpec).reason
+				run.WaitingSince = formatRunTime(since)
+			}
+		}
 		applyRunActivity(&run, events)
 		run.LastReceipt = latestRunReceipt(events)
 		if run.StageStartedAt == "" {
@@ -938,7 +951,8 @@ func (s *Server) activeRunLeaseSnapshots(now time.Time) ([]runLeaseSnapshot, err
 			continue
 		}
 		stageLeaseKey := leaseWorkKey(l)
-		key := s.canonicalRunKey(l.repo, l.number, runKeyOfLease(stageLeaseKey, l.repo), stageLeaseKey)
+		stageRunKey := runKeyOfLease(stageLeaseKey, l.repo)
+		key := s.canonicalRunKey(l.repo, l.number, stageRunKey, stageLeaseKey)
 		repo := s.canonicalRunRepo(l.repo, key)
 		info := infos[leaseKey(l.identity, l.taskID)]
 		title := info.title
@@ -950,11 +964,12 @@ func (s *Server) activeRunLeaseSnapshots(now time.Time) ([]runLeaseSnapshot, err
 		}
 		out = append(out, runLeaseSnapshot{
 			identity: l.identity, taskID: l.taskID, repo: repo, number: l.number,
-			key: key, leaseKey: stageLeaseKey, stage: l.stage, gen: l.gen, expiresAt: l.expiresAt,
+			key: key, leaseKey: stageLeaseKey, stageRunKey: stageRunKey, stage: l.stage, gen: l.gen, expiresAt: l.expiresAt,
 			title: title, stageStarted: info.startedAt, leaseHeartbeat: l.expiresAt.Add(-leaseTTL), serverSideLease: h.isPendingStageIdentity(l.identity),
 			claimedBy: l.claimedBy, claimExpiresAt: l.claimExpiresAt, claimPosted: l.claimPosted,
 			triageVerdict: l.triageVerdict, triageRationale: l.triageRationale,
-			workItem: l.workItem.Normalized(),
+			workItem:         l.workItem.Normalized(),
+			stageEscalatedAt: l.stageEscalatedAt,
 		})
 	}
 	return out, nil
@@ -1025,6 +1040,13 @@ func runFromLease(lease runLeaseSnapshot, plan runPlanSnapshot, hold runHumanRev
 	if !hold.UpdatedAt.IsZero() && runCheckpointBlocks(cfg, lease.stage) {
 		run.WaitingOn = RunWaitingOnHuman
 		run.WaitingSince = formatRunTime(hold.UpdatedAt)
+	}
+	if !lease.stageEscalatedAt.IsZero() {
+		// The stage spent runs.max_stage_retries (#9143); nothing will run it
+		// again until a person resets the stage or abandons the run.
+		run.WaitingOn = RunWaitingOnHuman
+		run.WaitingReason = runWaitingReasonStageBudgetExhausted
+		run.WaitingSince = formatRunTime(lease.stageEscalatedAt)
 	}
 	return run
 }

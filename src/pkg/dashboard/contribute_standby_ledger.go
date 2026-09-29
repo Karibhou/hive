@@ -1,7 +1,11 @@
 package dashboard
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -9,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	github "github.com/google/go-github/v72/github"
 	ghpkg "github.com/hivecommons/hive/pkg/github"
 	standbypkg "github.com/hivecommons/hive/pkg/standby"
 )
@@ -51,16 +56,25 @@ func (h *ContributeWSHub) standbyOutcomesPath() string {
 	return filepath.Join(getContributorsDir(), standbyOutcomesFileName)
 }
 
+// loadStandbyOutcomes restores the outcome ledger at hub startup. The ledger is
+// the record of which configurations are suspended, so an unreadable file is
+// reported at error level rather than dropped silently (#9184): starting from an
+// empty ledger reinstates every suspension it held.
 func (h *ContributeWSHub) loadStandbyOutcomes() {
 	if h != nil && !h.persistTaskLedgers {
 		return
 	}
-	data, err := os.ReadFile(h.standbyOutcomesPath())
+	path := h.standbyOutcomesPath()
+	data, err := os.ReadFile(path)
 	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			h.logger.Error("[contribute-ws] standby outcomes read failed; starting with an empty ledger, suspensions it held are not enforced", "path", path, "error", err)
+		}
 		return
 	}
 	var records []standbyOutcomeRecord
-	if json.Unmarshal(data, &records) != nil {
+	if err := json.Unmarshal(data, &records); err != nil {
+		h.logger.Error("[contribute-ws] standby outcomes unreadable; starting with an empty ledger, suspensions it held are not enforced", "path", path, "error", err)
 		return
 	}
 	h.completedMu.Lock()
@@ -68,10 +82,15 @@ func (h *ContributeWSHub) loadStandbyOutcomes() {
 	h.completedMu.Unlock()
 }
 
+// saveStandbyOutcomes persists the in-memory ledger. standbyOutcomesSaveMu is
+// held from the snapshot through the rename (#9184), so saves land in snapshot
+// order and a stale snapshot can never overwrite a newer one.
 func (h *ContributeWSHub) saveStandbyOutcomes() {
 	if h != nil && !h.persistTaskLedgers {
 		return
 	}
+	h.standbyOutcomesSaveMu.Lock()
+	defer h.standbyOutcomesSaveMu.Unlock()
 	h.completedMu.Lock()
 	records := append([]standbyOutcomeRecord(nil), h.standbyOutcomes...)
 	h.completedMu.Unlock()
@@ -80,19 +99,58 @@ func (h *ContributeWSHub) saveStandbyOutcomes() {
 		h.logger.Warn("[contribute-ws] standby outcomes marshal failed", "error", err)
 		return
 	}
-	path := h.standbyOutcomesPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		h.logger.Warn("[contribute-ws] standby outcomes directory creation failed", "error", err)
-		return
+	if err := writeStandbyOutcomesFile(h.standbyOutcomesPath(), data); err != nil {
+		h.logger.Warn("[contribute-ws] standby outcomes persist failed", "error", err)
 	}
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
-		h.logger.Warn("[contribute-ws] standby outcomes write failed", "error", err)
-		return
+}
+
+// writeStandbyOutcomesFile is the crash-safe persist of the #5625 idiom used
+// by saveLeasesLocked: a unique temp name (a fixed name lets two writers
+// interleave into one file and rename it torn), an fsync of the bytes before
+// the rename, and an fsync of the directory so the rename survives a crash.
+func writeStandbyOutcomesFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("directory creation: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("temp creation: %w", err)
+	}
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	// CreateTemp makes 0600; keep the mode this ledger has always had.
+	if err := tmp.Chmod(0o644); err != nil {
+		return fmt.Errorf("chmod: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		h.logger.Warn("[contribute-ws] standby outcomes rename failed", "error", err)
+		return fmt.Errorf("rename: %w", err)
 	}
+	keep = true
+	directory, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("directory open: %w", err)
+	}
+	defer func() { _ = directory.Close() }()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("directory sync: %w", err)
+	}
+	return nil
 }
 
 func (h *ContributeWSHub) appendStandbyOutcome(rec standbyOutcomeRecord) {
@@ -132,34 +190,75 @@ func (h *ContributeWSHub) recordVerifiedStandbyPR(contributor, lane, repo, prURL
 	})
 }
 
-func (h *ContributeWSHub) reconcileOpenStandbyOutcomes() {
+// Reconciliation is owned by one background worker. Suspension reads never do
+// network I/O, including reads under h.mu or on the WebSocket read loop. Wait
+// between completed passes so slow GitHub responses cannot queue more work.
+const standbyReconcileInterval = 5 * time.Minute
+
+func (h *ContributeWSHub) standbyReconcileLoop(ctx context.Context) {
+	defer close(h.standbyReconcileDone)
+	for {
+		timer := time.NewTimer(standbyReconcileInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			h.reconcileOpenStandbyOutcomes(ctx)
+		}
+	}
+}
+
+// reconcileOpenStandbyOutcomes settles open donated PRs against GitHub. Passes
+// are serialized on standbyReconcileMu, and settlement is re-checked against the
+// live ledger under completedMu right before appending (#9184): a closure
+// recorded while this pass was inside its GitHub GETs — by another path such
+// as the completion handler's merged row — must not be recorded a second time.
+func (h *ContributeWSHub) reconcileOpenStandbyOutcomes(ctx context.Context) {
 	if h == nil || h.server == nil || h.server.deps == nil || h.server.deps.GHClient == nil {
 		return
 	}
+	h.standbyReconcileMu.Lock()
+	defer h.standbyReconcileMu.Unlock()
+
 	h.completedMu.Lock()
 	rows := append([]standbyOutcomeRecord(nil), h.standbyOutcomes...)
 	h.completedMu.Unlock()
 
-	settled := map[string]bool{}
-	for _, rec := range rows {
-		if rec.Kind == standbypkg.OutcomeMerged || rec.Kind == standbypkg.OutcomeClosedUnmerged || rec.Kind == standbypkg.OutcomeMergedAfterRework {
-			settled[standbyOutcomePRKey(rec)] = true
-		}
-	}
+	settled := settledStandbyPRs(rows)
 
 	var add []standbyOutcomeRecord
+	checked := map[string]bool{}
 	for _, rec := range rows {
 		if rec.Kind != standbypkg.OutcomeOpen || rec.Repo == "" || rec.Number <= 0 || settled[standbyOutcomePRKey(rec)] {
 			continue
 		}
+		prKey := standbyOutcomePRKey(rec)
+		if checked[prKey] {
+			continue
+		}
+		checked[prKey] = true
+		if ctx.Err() != nil {
+			break
+		}
 		contributor, _, _ := strings.Cut(rec.Key, "|")
 		prURL := "https://github.com/" + rec.Repo + "/pull/" + strconv.Itoa(rec.Number)
-		detail := h.verifyReportedPRDetail(rec.Repo, prURL, contributor)
-		if !detail.Verified {
-			continue
+		// Use verification directly: a background lookup is not a reported
+		// completion and must not emit the misleading "no-PR" completion log.
+		lookupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		detail := h.server.deps.GHClient.VerifyReportedPR(lookupCtx, rec.Repo, prURL, contributor)
+		cancel()
+		var apiErr *github.ErrorResponse
+		missing := errors.As(detail.Err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == http.StatusNotFound
+		if !detail.Verified && !missing {
+			continue // transient and permission errors remain retryable
 		}
 		var kind standbypkg.OutcomeKind
 		switch {
+		case missing:
+			// Legacy dispatch rows name issues. A 404 is not evidence against
+			// a donor; retire it as unknown rather than retrying forever.
+			kind = standbypkg.OutcomeUnknown
 		case detail.Merged:
 			kind = standbypkg.OutcomeMerged
 		case strings.EqualFold(detail.State, "closed"):
@@ -182,9 +281,32 @@ func (h *ContributeWSHub) reconcileOpenStandbyOutcomes() {
 		return
 	}
 	h.completedMu.Lock()
-	h.standbyOutcomes = append(h.standbyOutcomes, add...)
+	live := settledStandbyPRs(h.standbyOutcomes)
+	appended := 0
+	for _, rec := range add {
+		if live[standbyOutcomePRKey(rec)] {
+			continue
+		}
+		h.standbyOutcomes = append(h.standbyOutcomes, rec)
+		appended++
+	}
 	h.completedMu.Unlock()
-	h.saveStandbyOutcomes()
+	if appended > 0 {
+		h.saveStandbyOutcomes()
+	}
+}
+
+// settledStandbyPRs is the set of donated PRs (by standbyOutcomePRKey) that
+// already carry a settled outcome row. An unknown row (a retired 404 lookup)
+// settles the PR too, so it is never looked up again.
+func settledStandbyPRs(rows []standbyOutcomeRecord) map[string]bool {
+	settled := map[string]bool{}
+	for _, rec := range rows {
+		if rec.Kind == standbypkg.OutcomeUnknown || rec.Kind == standbypkg.OutcomeMerged || rec.Kind == standbypkg.OutcomeClosedUnmerged || rec.Kind == standbypkg.OutcomeMergedAfterRework {
+			settled[standbyOutcomePRKey(rec)] = true
+		}
+	}
+	return settled
 }
 
 func standbyOutcomePRKey(rec standbyOutcomeRecord) string {
@@ -192,7 +314,6 @@ func standbyOutcomePRKey(rec standbyOutcomeRecord) string {
 }
 
 func (h *ContributeWSHub) standbySuspended(key string) (bool, int) {
-	h.reconcileOpenStandbyOutcomes()
 	h.completedMu.Lock()
 	defer h.completedMu.Unlock()
 	rows := standbypkg.OutcomesFor(h.standbyOutcomes, key)

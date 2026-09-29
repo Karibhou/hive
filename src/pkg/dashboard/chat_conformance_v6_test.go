@@ -76,7 +76,7 @@ func TestV6ConformanceDashboardChat_StartedBotGatesRepliesOnAllowlist(t *testing
 	s.RegisterAPI(&Dependencies{
 		Config:              &config.Config{},
 		DashboardChatSubmit: bot.Submit,
-		DashboardChatDrain:  chatDrainForTest(bot),
+		DashboardChatPoll:   chatPollForTest(bot),
 	})
 
 	submit := func(user string) {
@@ -98,7 +98,7 @@ func TestV6ConformanceDashboardChat_StartedBotGatesRepliesOnAllowlist(t *testing
 	submit("mallory")
 	submit("alice")
 
-	const helpMarker = "Hive v2 Discord Bot Commands"
+	const helpMarker = "**Hive Bot Commands**"
 	var msgs []interface{}
 	deadline := time.Now().Add(3 * time.Second)
 	for {

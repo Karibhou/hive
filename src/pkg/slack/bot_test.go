@@ -1,6 +1,7 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/hivecommons/hive/internal/testutil"
 	"github.com/hivecommons/hive/pkg/chat"
 )
 
@@ -27,6 +29,19 @@ func newTestBot(apiBase string) *Bot {
 	b.reconnectBase = time.Millisecond
 	b.reconnectMax = time.Millisecond
 	return b
+}
+
+// consumeOnce dials one socket and serves it until it ends.
+func consumeOnce(ctx context.Context, b *Bot, queue chan<- chat.Message) error {
+	conn, err := b.dialSocket(ctx)
+	if err != nil {
+		return err
+	}
+	next, err := b.serveSocket(ctx, conn, queue)
+	if next != nil {
+		_ = next.Close()
+	}
+	return err
 }
 
 func TestSendPostMessageSuccessAndMrkdwnSplit(t *testing.T) {
@@ -63,7 +78,7 @@ func TestSendPostMessageSuccessAndMrkdwnSplit(t *testing.T) {
 	}
 }
 
-func TestSendHonorsRetryAfterOn429(t *testing.T) {
+func TestSendReturnsRetryableOn429WithoutSleeping(t *testing.T) {
 	var slept time.Duration
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "2")
@@ -73,11 +88,62 @@ func TestSendHonorsRetryAfterOn429(t *testing.T) {
 
 	b := newTestBot(ts.URL)
 	b.sleep = func(d time.Duration) { slept = d }
-	if err := b.Send("hello"); err == nil || !strings.Contains(err.Error(), "429") {
-		t.Fatalf("Send error = %v, want 429", err)
+	err := b.Send("hello")
+	var retryable *chat.RetryableError
+	if !errors.As(err, &retryable) || retryable.RetryAfter != 2*time.Second {
+		t.Fatalf("Send error = %v, want chat.RetryableError with Retry-After 2s", err)
 	}
-	if slept != 2*time.Second {
-		t.Fatalf("slept = %v, want 2s", slept)
+	if !strings.Contains(err.Error(), "429") {
+		t.Fatalf("Send error = %v, want the 429 preserved", err)
+	}
+	// The wait belongs to the spine's drain loop, which is context-aware and
+	// caps it; a blocking sleep here would stall shutdown (hive#9127).
+	if slept != 0 {
+		t.Fatalf("Send slept %v on the caller's goroutine", slept)
+	}
+}
+
+// TestDrainRetriesAfter429 is the hive#9127 repro: Slack answers the first
+// chat.postMessage with 429 Retry-After and the reply used to be dropped
+// after the sleep. It must now be re-posted once the wait elapses.
+func TestDrainRetriesAfter429(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		attempts []string
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		attempts = append(attempts, body["text"])
+		n := len(attempts)
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer ts.Close()
+
+	b := NewBot(Config{AppToken: "xapp-test", BotToken: "xoxb-test", ChannelID: "C1", AllowedUsers: []string{"U1"}}, discardLogger())
+	b.apiBase = ts.URL
+	b.RegisterCommand("ping", func(context.Context, string) (string, error) { return "pong", nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.service.DrainLoop(ctx)
+	b.service.Deliver(ctx, chat.Message{ID: "1", Text: "!ping", AuthorID: "U1"})
+
+	testutil.Eventually(t, 5*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(attempts) >= 2
+	}, "rate-limited reply was never retried")
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts[0] != "pong" || attempts[1] != "pong" {
+		t.Fatalf("attempts = %q, want the same reply re-posted", attempts)
 	}
 }
 
@@ -360,8 +426,12 @@ func TestConsumeSocketIgnoresMalformedAndFiltersThenMarksBot(t *testing.T) {
 	apiBase = ts.URL
 
 	b := newTestBot(ts.URL)
+	queue := make(chan chat.Message, 10)
+	err := consumeOnce(context.Background(), b, queue)
 	var delivered []chat.Message
-	_, err := b.consumeSocket(context.Background(), func(msg chat.Message) { delivered = append(delivered, msg) })
+	for len(queue) > 0 {
+		delivered = append(delivered, <-queue)
+	}
 	if err == nil {
 		t.Fatal("expected close error")
 	}
@@ -461,6 +531,65 @@ func TestListenContextCancelClosesIdleSocket(t *testing.T) {
 	}
 }
 
+// Cancelling ctx closes the socket from under ReadMessage; that is a clean
+// shutdown, not a "disconnected" WARN (hivecommons/hive#9129).
+func TestListenContextCancelDoesNotWarn(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	apiBase := ""
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/apps.connections.open":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "url": strings.Replace(apiBase+"/socket", "http", "ws", 1)})
+		case "/socket":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			<-r.Context().Done()
+		}
+	}))
+	defer ts.Close()
+	apiBase = ts.URL
+
+	var logs bytes.Buffer
+	b := NewBot(Config{AppToken: "xapp-test", BotToken: "xoxb-test", ChannelID: "C1"}, slog.New(slog.NewTextHandler(&logs, nil)))
+	b.apiBase = ts.URL
+	// Signal only once the client handshake has completed: cancelling while
+	// Dial is still in flight would surface as context.Canceled, which the
+	// old guard also swallowed, and the test would pass without the fix.
+	connected := make(chan struct{})
+	var connectedOnce sync.Once
+	realDial := b.dial
+	b.dial = func(ctx context.Context, url string, h http.Header) (*websocket.Conn, *http.Response, error) {
+		conn, resp, err := realDial(ctx, url, h)
+		if err == nil {
+			connectedOnce.Do(func() { close(connected) })
+		}
+		return conn, resp, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		b.Listen(ctx, func(chat.Message) {})
+		close(done)
+	}()
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Listen never opened the socket")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Listen did not exit after context cancellation")
+	}
+	if strings.Contains(logs.String(), "slack socket disconnected") {
+		t.Fatalf("clean shutdown logged as a disconnect:\n%s", logs.String())
+	}
+}
+
 func TestListenBackoffResetsAfterConnectedSession(t *testing.T) {
 	var calls atomic.Int64
 	var mu sync.Mutex
@@ -490,6 +619,7 @@ func TestListenBackoffResetsAfterConnectedSession(t *testing.T) {
 	b := newTestBot(ts.URL)
 	b.reconnectBase = 20 * time.Millisecond
 	b.reconnectMax = 200 * time.Millisecond
+	b.jitter = func(d time.Duration) time.Duration { return d }
 	b.sleep = func(d time.Duration) {
 		mu.Lock()
 		delays = append(delays, d)
@@ -503,7 +633,9 @@ func TestListenBackoffResetsAfterConnectedSession(t *testing.T) {
 		close(done)
 	}()
 	deadline := time.After(2 * time.Second)
-	for calls.Load() < 4 {
+	// Call 4 is the refresh handoff dial (fails); call 5 follows the
+	// post-session sleep, so all three asserted delays are recorded by then.
+	for calls.Load() < 5 {
 		select {
 		case <-deadline:
 			t.Fatalf("timed out waiting for reconnects; calls=%d", calls.Load())
@@ -576,9 +708,9 @@ func TestConsumeSocketAckFailureSkipsDelivery(t *testing.T) {
 	apiBase = ts.URL
 
 	b := newTestBot(ts.URL)
-	var delivered atomic.Int64
-	_, _ = b.consumeSocket(context.Background(), func(chat.Message) { delivered.Add(1) })
-	if delivered.Load() != 0 {
-		t.Fatalf("delivered = %d, want 0 when ack fails", delivered.Load())
+	queue := make(chan chat.Message, 10)
+	_ = consumeOnce(context.Background(), b, queue)
+	if len(queue) != 0 {
+		t.Fatalf("delivered = %d, want 0 when ack fails", len(queue))
 	}
 }

@@ -80,7 +80,7 @@ phase map stays small.
   selection already used to build kicks. Per-lane queue depth is a count over
   work the scheduler already computes.
 - **The tier vocabulary.** `RotationConfig.AgentTiers`
-  (`src/pkg/config/config.go:1745`) already spells T1/T2/T3 in `hive.yaml`. It
+  (`src/pkg/config/provider_rotation.go:68`) already spells T1/T2/T3 in `hive.yaml`. It
   maps *agent names*, not models — so standby borrows the vocabulary and needs
   its own mapping (below).
 - **The relay's configuration report.** `auth_response` already carries
@@ -253,8 +253,8 @@ is unaffected" a property of the design rather than a hope.
 
 Two places, matching where each kind of setting already lives: per-lane
 behaviour under the agent, hive-wide allow-lists under `hub:` next to
-`contribute_allow_models` (`ContributeAllowModels`, `src/pkg/config/config.go:4110`) and
-`contribute_delegatable_roles` (`ContributeDelegatableRoles`, `src/pkg/config/config.go:4201`).
+`contribute_allow_models` (`ContributeAllowModels`, `src/pkg/config/hub_config.go:112`) and
+`contribute_delegatable_roles` (`ContributeDelegatableRoles`, `src/pkg/config/hub_config.go:233`).
 
 ```yaml
 agents:
@@ -274,10 +274,10 @@ hub:
     - { label: kind/security, tier: T1 }
 ```
 
-`standby` is a new block on `AgentConfig` (`src/pkg/config/config.go:974`); the
+`standby` is a new block on `AgentConfig` (`src/pkg/config/agent_config.go:142`); the
 three `hub.standby_*` keys are new fields on `HubConfig`. Both landed in S2:
-`AgentConfig.Standby` (`src/pkg/config/config.go:1140`) and
-`HubConfig.StandbyContributors` (`src/pkg/config/config.go:4211`) with its two
+`AgentConfig.Standby` (`src/pkg/config/agent_config.go:323`) and
+`HubConfig.StandbyContributors` (`src/pkg/config/hub_config.go:243`) with its two
 neighbours. The types, defaults and validation are `pkg/config/standby.go`.
 
 ### Validation rules
@@ -504,6 +504,10 @@ func SuspendState(rows []Outcome, threshold int) (suspended bool, streak int)
 - `merged_after_rework` → **counts as neither**; skipped, streak preserved.
 - `cleared` → resets to zero and stops.
 - `open` → skipped (not yet an outcome).
+- The rule counts PRs, not rows: a PR (`repo`, `number`) with more than one
+  settled row is read once, from its newest row
+  ([#9184](https://github.com/hivecommons/hive/issues/9184)). Rows naming no PR
+  are each read.
 - `suspended` when `streak >= threshold`; `threshold` defaults to 2.
 
 The function is total, takes no clock, and is tested as a table. The default of
@@ -652,7 +656,7 @@ per the v6 guard invariant). Nothing dispatches.
 
 ### S2 — Configuration and the approved list, validation only
 
-`src/pkg/config/config.go` (`AgentConfig.Standby`; `HubConfig.StandbyContributors`,
+`src/pkg/config/agent_config.go` (`AgentConfig.Standby`) · `src/pkg/config/hub_config.go` (`HubConfig.StandbyContributors`,
 `StandbyModelTiers`, `StandbyAllowPrivateRepos`) · the config `Normalize`/
 validation path · `src/hive.yaml.example` · `src/docs/agent-configuration.md`.
 No behaviour reads the block yet.
@@ -700,7 +704,7 @@ standby offers paused budget work, not an alternate path around normal cadence.
 
 ### S7 — Item-tier matching and the owner-editable T3 list
 
-`src/pkg/config/config.go` (`hub.standby_item_tiers`, empty default) ·
+`src/pkg/config/hub_config.go` (`hub.standby_item_tiers`, empty default) ·
 `src/pkg/standby/` (item tier threaded into `Qualifies`) ·
 `src/pkg/classify/classifier.go` (reuse label routing to propose an item's tier
 candidate; the owner's list is authoritative).
@@ -867,3 +871,18 @@ construction. The live-hive runbook above stays a human's job.
 - Mode ladder and hold gating: [`src/docs/acmm-policy-matrix.md`](../acmm-policy-matrix.md),
   `src/pkg/agentmode/agentmode.go`, `src/pkg/github/pr_request_watcher.go`.
 - CI surface: [`src/docs/backend-smoke.md`](../backend-smoke.md).
+
+### Outcome reconciliation
+
+The hub reads the local outcome ledger when evaluating suspension, including
+status counts and standby declarations. A single background worker waits five
+minutes between reconciliation passes; GitHub lookups never run on those read
+paths. Shutdown cancels any in-flight lookup and waits for the worker. A newly
+closed PR can therefore take a reconciliation interval plus the pass duration
+to affect suspension.
+
+Dispatch is recorded in the daily-cap ledger only. Outcome `open` rows identify
+verified PRs, never assignment issue numbers. A GitHub 404 retires an old open
+row with an unknown outcome, which does not count toward suspension; transient
+failures and permission errors other than 404 remain retryable. The persisted
+outcome ledger remains an append-only audit history.
