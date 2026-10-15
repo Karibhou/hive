@@ -7,6 +7,7 @@ package automerge
 // and the lane string recorded on the mutation claim distinguishes the two.
 
 import (
+	"context"
 	"testing"
 
 	gh "github.com/google/go-github/v72/github"
@@ -71,5 +72,50 @@ func TestPrefilterSelfAuthoredPRAdmitsTrustedBot(t *testing.T) {
 	pr.Draft = nil
 	if got := c.prefilterSelfAuthoredPR(pr); got != "not-app-authored" {
 		t.Fatalf("revoked trusted bot should be not-app-authored, got %q", got)
+	}
+}
+
+func TestPrefilterTrustedAuthorPRSkipsTrustedBotLane(t *testing.T) {
+	trustedAuthorChecks := 0
+	c := newTrustedBotEngine(t, func() map[string]bool { return map[string]bool{"dependabot[bot]": true} })
+	c.trustedAuthorizer = func(string, string) TrustedAuthorDecision {
+		trustedAuthorChecks++
+		return TrustedAuthorDecision{}
+	}
+	pr := selfAuthoredListPR(func(pr *gh.PullRequest) {
+		pr.User = &gh.User{Login: gh.Ptr("dependabot[bot]")}
+	})
+
+	if got := c.prefilterTrustedAuthorPR(pr, TrustedAuthorPolicy{RequireRole: "merger"}); got != trustedBotLaneSkipReason {
+		t.Fatalf("prefilterTrustedAuthorPR = %q, want %q", got, trustedBotLaneSkipReason)
+	}
+	if trustedAuthorChecks != 0 {
+		t.Fatalf("trusted-author checks = %d, want 0 for trusted-bot lane", trustedAuthorChecks)
+	}
+}
+
+func TestTrustedAuthorSweepDoesNotEvaluateTrustedBotLane(t *testing.T) {
+	fx := trustedSweepFixture{author: "dependabot[bot]"}
+	api := newTrustedSweepAPI(t, &fx)
+	defer api.Close()
+	policy := TrustedAuthorPolicy{Enabled: true, RequireRole: "merger"}
+	trustedAuthorChecks := 0
+	c := newTrustedSweepEngine(api.URL, policy, Options{
+		TrustedBotAuthors: func() map[string]bool { return map[string]bool{"dependabot[bot]": true} },
+	})
+	c.trustedAuthorizer = func(string, string) TrustedAuthorDecision {
+		trustedAuthorChecks++
+		return TrustedAuthorDecision{}
+	}
+
+	result, err := c.SweepTrustedAuthorAutoMerges(context.Background(), AutoMergeSweepOptions{})
+	if err != nil {
+		t.Fatalf("SweepTrustedAuthorAutoMerges: %v", err)
+	}
+	if trustedAuthorChecks != 0 {
+		t.Fatalf("trusted-author checks = %d, want 0 for trusted-bot lane", trustedAuthorChecks)
+	}
+	if result.Seen != 1 || result.Candidates != 0 || result.Skipped != 0 {
+		t.Fatalf("result = %+v, want trusted bot omitted from trusted-author results", result)
 	}
 }

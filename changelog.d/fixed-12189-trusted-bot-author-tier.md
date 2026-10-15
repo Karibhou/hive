@@ -1,0 +1,1 @@
+- Keep trusted-bot automerge skips out of the trusted-author tier.

@@ -262,6 +262,10 @@ const selfMergeMinACMMLevel = 6
 const SelfMergeMinACMMLevel = selfMergeMinACMMLevel
 
 const DefaultAutoMergeSweepMaxMerges = 3
+
+// trustedBotLaneSkipReason keeps trusted-bot PRs out of the human-author tier.
+// The self-authored sweep records their actual eligibility result.
+const trustedBotLaneSkipReason = "trusted-bot-lane"
 const selfAuthoredSweepMaxBranchUpdates = 5
 
 const releaseInProgressStatusContext = "release-in-progress"
@@ -969,6 +973,12 @@ func (c *Engine) SweepTrustedAuthorAutoMerges(ctx context.Context, opts AutoMerg
 			}
 			result.Seen++
 			if reason := c.prefilterTrustedAuthorPR(pr, policy); reason != "" {
+				// Trusted bots belong exclusively to the self-authored lane. Their
+				// eligibility outcome is recorded there, so do not emit a second,
+				// misleading trusted-author skip for the same PR.
+				if reason == trustedBotLaneSkipReason {
+					continue
+				}
 				c.info("automerge skip", "repo", displayRepo, "pr", number, "reason", reason, "tier", "trusted-author")
 				result.Skipped++
 				continue
@@ -1547,6 +1557,9 @@ func (c *Engine) prefilterTrustedAuthorPR(pr *gh.PullRequest, policy TrustedAuth
 	}
 	if pr.GetDraft() {
 		return "draft"
+	}
+	if lane, ok := c.sweepLaneForAuthor(hgithub.SafeGetLogin(pr.GetUser())); ok && lane == "trusted-bot" {
+		return trustedBotLaneSkipReason
 	}
 	labels := labelNames(pr.Labels)
 	if blocked := c.labelBlockReason(labels, true); blocked != "" {
