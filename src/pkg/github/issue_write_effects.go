@@ -55,6 +55,9 @@ func isDefiniteIssueWriteRefusal(err error) bool {
 // on GitHub replays as idempotent success, an absent one runs again. When the
 // issue cannot be read the original refusal stands (#11556).
 func (c *Client) executeIssueWrite(ctx context.Context, claim effects.Claim, effect func(context.Context) (effects.Result, error), observe func(context.Context) (effects.ExternalState, error)) error {
+	if claim.Kind == effects.KindLabelMutation {
+		claim.ObserveApplied = observe
+	}
 	boundary := c.mutationBoundary()
 	_, err := effects.Execute(ctx, boundary, claim, effect)
 	if !errors.Is(err, effects.ErrNeedsReconciliation) {
