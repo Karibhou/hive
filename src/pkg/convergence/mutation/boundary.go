@@ -98,8 +98,20 @@ func (b *Boundary) Execute(ctx context.Context, claim effects.Claim, effect func
 				"kind", claim.Kind, "target", claim.Target, "applied", state.Applied)
 		}
 		if !state.Applied {
-			if err := executor.Ledger.ValidateEpoch(mclaim.Key(), entry.Epoch, executor.now()); err != nil && FencingEnabled(executor.Mode) {
-				return out, fmt.Errorf("%w: %v", effects.ErrDenied, err)
+			if err := executor.Ledger.ValidateEpoch(mclaim.Key(), entry.Epoch, executor.now()); err != nil {
+				if FencingEnabled(executor.Mode) {
+					if b.Stats != nil {
+						b.Stats.IncDenied()
+					}
+					return out, fmt.Errorf("%w: %v", effects.ErrDenied, err)
+				}
+				if b.Logger != nil {
+					b.Logger.Warn("shadow fence would have denied label replay",
+						"repo", claim.Repo, "kind", claim.Kind, "target", claim.Target, "error", err)
+				}
+				if b.Stats != nil {
+					b.Stats.IncFenced()
+				}
 			}
 			if err := executor.Journal.reopenLabel(op, executor.now()); err != nil {
 				return out, err
