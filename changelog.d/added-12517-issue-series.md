@@ -1,0 +1,1 @@
+- Work balance can use backfilled GitHub issue history, including human opens and older issues closed in the selected window, with audit fallback and per-week source labels ([#12517](https://github.com/hivecommons/hive/issues/12517)).
