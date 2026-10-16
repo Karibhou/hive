@@ -1439,10 +1439,6 @@ func (c *Engine) releaseLevelHoldIfEligible(ctx context.Context, owner, repo str
 	return transport.ReleaseLevelHoldIfEligible(ctx, owner, repo, pr)
 }
 
-// isHeld is the sweep's single hold predicate. It defers to the transport so
-// the configured hold set (generic substrings plus the exact hive-scoped
-// `hive-pause/<hive-id>` dashboard hold) gates merges exactly as it gates
-// enumeration. A nil engine or transport fails closed to the generic set.
 // sweepLaneForAuthor reports which self-authored-sweep lane a PR author falls
 // in: "self-authored" for the App's own login, "trusted-bot" for a login in
 // the operator's trusted_bot_authors set, or ok=false for anyone else. The
@@ -1476,6 +1472,10 @@ func (c *Engine) isTrustedBotLaneAuthor(author string) bool {
 	return ok && lane == "trusted-bot"
 }
 
+// isHeld is the sweep's single hold predicate. It defers to the transport so
+// the configured hold set (generic substrings plus the exact hive-scoped
+// `hive-pause/<hive-id>` dashboard hold) gates merges exactly as it gates
+// enumeration. A nil engine or transport fails closed to the generic set.
 func (c *Engine) isHeld(labels []string) bool {
 	if c == nil || c.transport == nil {
 		return hgithub.HasHoldLabel(labels)
