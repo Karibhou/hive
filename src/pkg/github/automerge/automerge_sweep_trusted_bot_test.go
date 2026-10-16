@@ -75,26 +75,52 @@ func TestPrefilterSelfAuthoredPRAdmitsTrustedBot(t *testing.T) {
 	}
 }
 
-func TestPrefilterTrustedAuthorPRSkipsTrustedBotLane(t *testing.T) {
-	trustedAuthorChecks := 0
+func TestPrefilterTrustedAuthorPRDoesNotSpecialCaseTrustedBot(t *testing.T) {
+	// The prefilter's contract is genuine skip reasons only; lane hand-off is
+	// the sweep loop's decision, so a trusted bot here is judged by the role
+	// gate like any other author.
 	c := newTrustedBotEngine(t, func() map[string]bool { return map[string]bool{"dependabot[bot]": true} })
+	c.trustedAuthorizer = func(string, string) TrustedAuthorDecision { return TrustedAuthorDecision{} }
+	pr := selfAuthoredListPR(func(pr *gh.PullRequest) {
+		pr.User = &gh.User{Login: gh.Ptr("dependabot[bot]")}
+	})
+	if got := c.prefilterTrustedAuthorPR(pr, TrustedAuthorPolicy{RequireRole: "merger"}); got != "untrusted-author-role" {
+		t.Fatalf("prefilterTrustedAuthorPR = %q, want untrusted-author-role", got)
+	}
+}
+
+func TestTrustedAuthorSweepHandsTrustedBotToSelfAuthoredLane(t *testing.T) {
+	fx := trustedSweepFixture{author: "dependabot[bot]"}
+	api := newTrustedSweepAPI(t, &fx)
+	defer api.Close()
+	policy := TrustedAuthorPolicy{Enabled: true, RequireRole: "merger"}
+	trustedAuthorChecks := 0
+	c := newTrustedSweepEngine(api.URL, policy, Options{
+		TrustedBotAuthors: func() map[string]bool { return map[string]bool{"dependabot[bot]": true} },
+	})
 	c.trustedAuthorizer = func(string, string) TrustedAuthorDecision {
 		trustedAuthorChecks++
 		return TrustedAuthorDecision{}
 	}
-	pr := selfAuthoredListPR(func(pr *gh.PullRequest) {
-		pr.User = &gh.User{Login: gh.Ptr("dependabot[bot]")}
-	})
 
-	if got := c.prefilterTrustedAuthorPR(pr, TrustedAuthorPolicy{RequireRole: "merger"}); got != trustedBotLaneSkipReason {
-		t.Fatalf("prefilterTrustedAuthorPR = %q, want %q", got, trustedBotLaneSkipReason)
+	result, err := c.SweepTrustedAuthorAutoMerges(context.Background(), AutoMergeSweepOptions{SelfAuthoredLaneActive: true})
+	if err != nil {
+		t.Fatalf("SweepTrustedAuthorAutoMerges: %v", err)
 	}
 	if trustedAuthorChecks != 0 {
 		t.Fatalf("trusted-author checks = %d, want 0 for trusted-bot lane", trustedAuthorChecks)
 	}
+	// Seen == Skipped + Candidates + len(Merged): the hand-off is a counted
+	// skip (reason trusted-bot-lane), not a silently dropped PR.
+	if result.Seen != 1 || result.Candidates != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %+v, want trusted bot counted as a skipped hand-off", result)
+	}
 }
 
-func TestTrustedAuthorSweepDoesNotEvaluateTrustedBotLane(t *testing.T) {
+func TestTrustedAuthorSweepEvaluatesTrustedBotWhenSelfAuthoredLaneInactive(t *testing.T) {
+	// ACMM below the self-merge floor (or self_authored off): no other sweep
+	// will ever look at the bot's PR, so the trusted-author tier must keep
+	// judging it by role — and may merge it when the operator granted one.
 	fx := trustedSweepFixture{author: "dependabot[bot]"}
 	api := newTrustedSweepAPI(t, &fx)
 	defer api.Close()
@@ -112,10 +138,10 @@ func TestTrustedAuthorSweepDoesNotEvaluateTrustedBotLane(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SweepTrustedAuthorAutoMerges: %v", err)
 	}
-	if trustedAuthorChecks != 0 {
-		t.Fatalf("trusted-author checks = %d, want 0 for trusted-bot lane", trustedAuthorChecks)
+	if trustedAuthorChecks == 0 {
+		t.Fatal("trusted-author role check must run when the self-authored lane is inactive")
 	}
-	if result.Seen != 1 || result.Candidates != 0 || result.Skipped != 0 {
-		t.Fatalf("result = %+v, want trusted bot omitted from trusted-author results", result)
+	if result.Seen != 1 || result.Candidates != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %+v, want trusted bot skipped as untrusted-author-role", result)
 	}
 }
