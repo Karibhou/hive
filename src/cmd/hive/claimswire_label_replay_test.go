@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hivecommons/hive/internal/testutil"
 	"github.com/hivecommons/hive/pkg/claims"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/convergence/mutation"
@@ -69,22 +70,19 @@ func TestClaimHooksRemoveLabelAfterSecondClaimExpires(t *testing.T) {
 	l.SetNow(func() time.Time { return now })
 	wait := func(wantAdds, wantRemoves int) {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
+		key := mutation.TaskClaim("o/r", "o/r#label_mutation/63").Key()
+		testutil.Eventually(t, 5*time.Second, func() bool {
 			mu.Lock()
 			a, r := adds, removes
 			mu.Unlock()
-			if a == wantAdds && r == wantRemoves {
-				// Wait until the boundary has durably acknowledged the HTTP response
-				// and released the writer before starting the next hook.
-				key := mutation.TaskClaim("o/r", "o/r#label_mutation/63").Key()
-				if entry, ok := ml.Get(key); ok && entry.State == mutation.StateReleased {
-					return
-				}
+			if a != wantAdds || r != wantRemoves {
+				return false
 			}
-			time.Sleep(time.Millisecond)
-		}
-		t.Fatalf("hooks did not complete: want adds=%d removes=%d", wantAdds, wantRemoves)
+			// Wait until the boundary has durably acknowledged the HTTP response
+			// and released the writer before starting the next hook.
+			entry, ok := ml.Get(key)
+			return ok && entry.State == mutation.StateReleased
+		}, "hooks did not complete: want adds=%d removes=%d", wantAdds, wantRemoves)
 	}
 	for cycle := 1; cycle <= 2; cycle++ {
 		if _, err := l.Claim(claims.Request{Repo: "o/r", Issue: 63, Holder: "alice", Kind: claims.KindHuman, TTL: time.Minute}); err != nil {
