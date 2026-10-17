@@ -308,10 +308,9 @@ records GitHub issues opened and closed in the range as ISO-week files at
 contains pull requests; these are excluded. The command scans older issues too,
 so a close in the range is counted even if the issue opened earlier. Each file
 includes zero-count weeks, event times for exact custom summary windows, and
-coverage bounds. Re-run it to refresh recent weeks. The dashboard uses GitHub
-totals for covered weeks, retains audit counts for uncovered weeks, and marks
-the source as `github`, `audit`, or `both` (GitHub totals win for `both`). This
-is reporting data only and does not affect merge eligibility.
+coverage bounds. Re-run it to refresh recent weeks. The files are reporting data
+for operators and downstream readers; the dashboard work-balance card now uses
+its collector-maintained rollup, and neither path affects merge eligibility.
 
 ### observe — read-only metrics
 

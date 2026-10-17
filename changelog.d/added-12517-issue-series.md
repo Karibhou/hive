@@ -1,1 +1,1 @@
-- Work balance can use backfilled GitHub issue history, including human opens and older issues closed in the selected window, with audit fallback and per-week source labels ([#12517](https://github.com/hivecommons/hive/issues/12517)).
+- `hivectl evidence backfill-issues` writes weekly GitHub issue-open and issue-close series files for reporting and downstream evidence readers ([#12517](https://github.com/hivecommons/hive/issues/12517)).
