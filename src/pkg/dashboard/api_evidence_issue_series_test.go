@@ -17,8 +17,8 @@ func historicalIssueWeek(start time.Time) evidence.IssueWeek {
 		Week: evidenceWeekKey(start), CoveredFrom: start, CoveredTo: start.AddDate(0, 0, 7),
 		Opened: map[string]int{"human": 1}, Closed: 1,
 		Events: []evidence.IssueEvent{
-			{At: start.Add(time.Hour), Action: "opened", Kind: "human"},
-			{At: start.Add(2 * time.Hour), Action: "closed"},
+			{At: start.Add(time.Hour), Action: evidence.IssueActionOpened, Kind: evidence.AuthorHuman},
+			{At: start.Add(2 * time.Hour), Action: evidence.IssueActionClosed},
 		},
 	}
 }
@@ -39,7 +39,7 @@ func TestEvidenceIssueSeriesCollectorBoundary(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			in := evidenceWorkBalanceInputs{
-				Series: []evidenceIssueSeriesWeek{
+				Series: []evidence.IssueSeriesWeek{
 					{Repo: "o/r", IssueWeek: historicalIssueWeek(old)},
 					{Repo: "o/r", IssueWeek: historicalIssueWeek(boundary)},
 					{Repo: "x/y", IssueWeek: historicalIssueWeek(old)},
@@ -73,7 +73,7 @@ func TestEvidenceIssueSeriesWindowAndFallback(t *testing.T) {
 	start := time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC)
 	w := historicalIssueWeek(start)
 	in := evidenceWorkBalanceInputs{
-		Series:  []evidenceIssueSeriesWeek{{Repo: "o/r", IssueWeek: w}},
+		Series:  []evidence.IssueSeriesWeek{{Repo: "o/r", IssueWeek: w}},
 		Entries: []AuditEntry{{Timestamp: start.Add(time.Hour).Format(time.RFC3339), Action: ghpkg.AuditActionAgentIssueCreated, Repo: "o/r", Target: 1}},
 	}
 	win := evidenceWindow{Custom: true, From: start.Add(time.Hour), To: start.Add(2 * time.Hour)}
@@ -141,7 +141,7 @@ func TestHandleEvidenceSummaryHistoricalIssueSeries(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	loaded := loadEvidenceIssueSeries(ghpkg.ReviewEvidenceRoot)
+	loaded := evidence.LoadIssueSeries(ghpkg.ReviewEvidenceRoot)
 	if len(loaded) != 1 || loaded[0].Repo != "x/y" {
 		t.Fatalf("malformed file must not hide other repos: %+v", loaded)
 	}

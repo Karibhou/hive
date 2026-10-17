@@ -1,7 +1,6 @@
 package dashboard
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -102,12 +101,11 @@ type evidenceWorkBalanceInputs struct {
 	Rollup  IssueActivityRollup
 	PRs     map[string]*evidence.PR
 	Buckets []hivestate.Bucket
-	Series  []evidenceIssueSeriesWeek
+	Series  []evidence.IssueSeriesWeek
 }
 
 func evidenceWeekKey(t time.Time) string {
-	y, w := t.UTC().ISOWeek()
-	return fmt.Sprintf("%04d-W%02d", y, w)
+	return evidence.IssueWeekKey(t)
 }
 
 // evidenceWeekStart is the UTC Monday 00:00 of the ISO week containing t.
@@ -192,14 +190,14 @@ func buildEvidenceWorkBalance(in evidenceWorkBalanceInputs, win evidenceWindow, 
 		r := row(start) // Zero-event files still establish observed coverage.
 		r.IssueSource = evidenceWorkBalanceSourceGitHub
 		for _, event := range w.Events {
-			if evidenceWeekKey(event.At) != w.Week || event.At.Before(w.CoveredFrom) || !event.At.Before(w.CoveredTo) || !evidenceWindowHasTime(win, event.At) {
+			if !w.Covers(event.At) || !evidenceWindowHasTime(win, event.At) {
 				continue
 			}
 			switch event.Action {
-			case "opened":
+			case evidence.IssueActionOpened:
 				r.Opened[event.Kind]++
 				r.N++
-			case "closed":
+			case evidence.IssueActionClosed:
 				r.Closed++
 				r.N++
 			}

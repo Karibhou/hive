@@ -553,7 +553,7 @@ func (s *Server) handleEvidenceSummary(w http.ResponseWriter, r *http.Request) {
 	resp.WorkBalance, resp.WorkBalanceSources = buildEvidenceWorkBalance(evidenceWorkBalanceInputs{
 		Entries: evidenceWorkBalanceEntries(s.audit),
 		Rollup:  loadIssueActivityRollup(issueActivityPath),
-		Series:  loadEvidenceIssueSeries(ghpkg.ReviewEvidenceRoot),
+		Series:  evidence.LoadIssueSeries(ghpkg.ReviewEvidenceRoot),
 		PRs:     evidence.FoldPRs(bundles, repo, ""),
 		Buckets: s.evidenceWorkBalanceBuckets(win),
 	}, win, repo)
@@ -598,7 +598,7 @@ func loadEvidenceBundles(root string) ([]*evidence.Bundle, int, error) {
 		if d.IsDir() {
 			// Reporting series share the root but are not review bundles.
 			rel, _ := filepath.Rel(root, path)
-			issueSeries := d.Name() == "issues" && len(strings.Split(rel, string(filepath.Separator))) == 3
+			issueSeries := d.Name() == evidence.IssueSeriesDirName && len(strings.Split(rel, string(filepath.Separator))) == 3
 			if (d.Name() == complexity.DirName || issueSeries) && path != root {
 				return filepath.SkipDir
 			}
