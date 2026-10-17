@@ -1,1 +1,0 @@
-- Stop agent-filed issues from carrying redundant bare lane labels alongside canonical origin/<lane> provenance.
