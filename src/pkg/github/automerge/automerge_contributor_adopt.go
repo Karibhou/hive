@@ -235,7 +235,7 @@ const AdoptionYieldMarker = "<!-- hive:adoption-yield"
 
 // AdoptionYieldComment is that note.
 func AdoptionYieldComment(obs stageObservation) string {
-	return fmt.Sprintf("%s head=%s -->\n@%s you pushed a new head, so the hive has handed this PR back to you (`%s` → `%s`). It will nudge again if CI stays red.",
+	return fmt.Sprintf("%s head=%s -->\n@%s this PR has a new head without a confirmed hive push, so the hive has handed it back to you (`%s` → `%s`). It will nudge again if CI stays red.",
 		AdoptionYieldMarker, obs.HeadSHA, obs.Author, stagelabels.AdoptedByHive.Label(), stagelabels.ReturnedToContributor.Label())
 }
 
@@ -406,12 +406,9 @@ func (c *Engine) canPushToPRBranch(ctx context.Context, obs stageObservation) bo
 	return pr.GetMaintainerCanModify()
 }
 
-// settleInPlaceAdoption handles a head change on an in-place-adopted PR:
-// a push by the contributor means they are back, so the hive yields — one
-// note, adoption forgotten, the ordinary 072 flow re-arms. Any other push
-// keeps the adoption and moves it to the new head: the App's own commits,
-// and the fixer agents' commits, which carry a bare git identity (e.g.
-// "scanner") with no GitHub login and so cannot be matched to the App.
+// settleInPlaceAdoption releases ownership on a changed head unless GitHub's
+// push events positively attribute that branch update to the configured App.
+// Commit authorship (including linked logins) is not pusher authentication.
 // Returns the number of comments posted.
 func (c *Engine) settleInPlaceAdoption(ctx context.Context, store *stagelabels.Store, key string, obs stageObservation, prev stagelabels.Record) (int, error) {
 	if !prev.AdoptedInPlace() || obs.HeadSHA == "" || obs.HeadSHA == prev.AdoptedHead {
@@ -420,21 +417,17 @@ func (c *Engine) settleInPlaceAdoption(ctx context.Context, store *stagelabels.S
 	if prev.YieldedHead == obs.HeadSHA {
 		return 0, nil
 	}
-	app := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(c.transport.AppBotLogin()), "[bot]"))
-	commit, _, err := c.gh.Repositories.GetCommit(ctx, obs.Owner, obs.Repo, obs.HeadSHA, nil)
+	hivePush, err := c.adoptedHeadPushedByApp(ctx, obs, prev)
 	if err != nil {
-		// Unknown pusher: keep the adoption rather than bounce the PR.
-		c.warn("stage labels: adopted head changed; pusher unknown, keeping adoption", "repo", obs.Display, "pr", obs.Number, "head", obs.HeadSHA, "error", err)
-		store.MarkAdoptedHead(key, obs.HeadSHA)
-		return 0, nil
+		c.warn("stage labels: adopted head changed; push attribution unavailable, releasing adoption", "repo", obs.Display, "pr", obs.Number, "head", obs.HeadSHA, "error", err)
 	}
-	if commitByLogin(commit, app) || !commitByContributor(commit, obs.Author) {
+	if hivePush {
 		store.MarkAdoptedHead(key, obs.HeadSHA)
-		c.info("stage labels: adopted PR advanced by the hive", "repo", obs.Display, "pr", obs.Number, "head", obs.HeadSHA, "pusher", commitIdentity(commit))
+		c.info("stage labels: adopted PR advanced by the hive", "repo", obs.Display, "pr", obs.Number, "head", obs.HeadSHA)
 		return 0, nil
 	}
 	store.MarkYielded(key, obs.HeadSHA)
-	c.info("stage labels: contributor pushed over in-place adoption; yielding", "repo", obs.Display, "pr", obs.Number, "author", obs.Author, "head", obs.HeadSHA)
+	c.info("stage labels: head changed without authenticated hive push; yielding", "repo", obs.Display, "pr", obs.Number, "author", obs.Author, "head", obs.HeadSHA)
 	if _, _, err := c.gh.Issues.CreateComment(ctx, obs.Owner, obs.Repo, obs.Number, &gh.IssueComment{Body: gh.Ptr(AdoptionYieldComment(obs))}); err != nil {
 		c.warn("stage labels: adoption yield note failed", "repo", obs.Display, "pr", obs.Number, "error", err)
 		return 0, err
@@ -442,50 +435,44 @@ func (c *Engine) settleInPlaceAdoption(ctx context.Context, store *stagelabels.S
 	return 1, nil
 }
 
-// commitByContributor reports whether the commit is attributable to the PR
-// author: a matching GitHub login, or — for an unlinked identity — a git
-// author/committer name equal to the login.
-func commitByContributor(commit *gh.RepositoryCommit, author string) bool {
-	author = strings.ToLower(strings.TrimSpace(author))
-	if commit == nil || author == "" {
-		return false
+// adoptedHeadPushedByApp reads the head repository's activity, not commit
+// metadata. Events are newest first; only the latest push to this exact ref
+// can establish ownership. The before SHA and timestamp bind it to this
+// adoption, excluding unrelated branches and older pushes of the same commit.
+// GitHub's event feed is delayed and bounded (300 events): missing evidence
+// deliberately releases adoption rather than guessing who pushed.
+func (c *Engine) adoptedHeadPushedByApp(ctx context.Context, obs stageObservation, prev stagelabels.Record) (bool, error) {
+	app := strings.TrimSpace(c.transport.AppBotLogin())
+	owner, repo, ok := strings.Cut(obs.HeadRepo, "/")
+	if !ok || owner == "" || repo == "" || obs.HeadRef == "" || app == "" {
+		return false, nil
 	}
-	if commitByLogin(commit, author) {
-		return true
-	}
-	if c := commit.GetCommit(); c != nil {
-		for _, u := range []*gh.CommitAuthor{c.GetAuthor(), c.GetCommitter()} {
-			if strings.EqualFold(strings.TrimSpace(u.GetName()), author) {
-				return true
+	opts := &gh.ListOptions{PerPage: 100}
+	for page := 1; page <= 3; page++ {
+		opts.Page = page
+		events, resp, err := c.gh.Activity.ListRepositoryEvents(ctx, owner, repo, opts)
+		if err != nil {
+			return false, err
+		}
+		for _, event := range events {
+			if event.GetType() != "PushEvent" {
+				continue
 			}
+			payload, err := event.ParsePayload()
+			if err != nil {
+				return false, err
+			}
+			push, ok := payload.(*gh.PushEvent)
+			if !ok || push.GetRef() != "refs/heads/"+obs.HeadRef {
+				continue
+			}
+			return push.GetHead() == obs.HeadSHA && push.GetBefore() == prev.AdoptedHead &&
+				!event.GetCreatedAt().Time.Before(prev.AdoptedAt) &&
+				strings.EqualFold(event.GetActor().GetLogin(), app), nil
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
 		}
 	}
-	return false
-}
-
-// commitIdentity renders the commit's pusher for logs: the GitHub login when
-// linked, else the git author name.
-func commitIdentity(commit *gh.RepositoryCommit) string {
-	if commit == nil {
-		return ""
-	}
-	if l := commit.GetAuthor().GetLogin(); l != "" {
-		return l
-	}
-	if l := commit.GetCommitter().GetLogin(); l != "" {
-		return l
-	}
-	return commit.GetCommit().GetAuthor().GetName()
-}
-
-// commitByLogin reports whether the commit's GitHub author or committer is
-// login ([bot] suffix tolerated).
-func commitByLogin(commit *gh.RepositoryCommit, login string) bool {
-	if commit == nil || login == "" {
-		return false
-	}
-	norm := func(u *gh.User) string {
-		return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(u.GetLogin()), "[bot]"))
-	}
-	return norm(commit.GetAuthor()) == login || norm(commit.GetCommitter()) == login
+	return false, nil
 }

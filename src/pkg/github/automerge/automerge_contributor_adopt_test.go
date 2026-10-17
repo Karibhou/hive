@@ -16,14 +16,16 @@ import (
 // adoptAPI layers the git-ref / pull-request routes the adoption needs on
 // top of stageAPI and records what the hive did.
 type adoptAPI struct {
-	mu          sync.Mutex
-	refs        map[string]string // refs/heads/x → sha
-	refUpdates  []string
-	pulls       []map[string]any
-	nextPR      int
-	superseders map[int]map[string]any // number → GET payload
-	prEdits     []string
-	commits     map[string]string // sha → GitHub login of author/committer
+	mu           sync.Mutex
+	refs         map[string]string // refs/heads/x → sha
+	refUpdates   []string
+	pulls        []map[string]any
+	nextPR       int
+	superseders  map[int]map[string]any // number → GET payload
+	prEdits      []string
+	commits      map[string]string // sha → GitHub login of author/committer
+	events       []map[string]any
+	eventsStatus int
 }
 
 func newAdoptAPI() *adoptAPI {
@@ -35,6 +37,13 @@ func (a *adoptAPI) handle(w http.ResponseWriter, r *http.Request) bool {
 	defer a.mu.Unlock()
 	path := r.URL.Path
 	switch {
+	case r.Method == http.MethodGet && path == "/repos/mallory/widget/events":
+		if a.eventsStatus != 0 {
+			w.WriteHeader(a.eventsStatus)
+			return true
+		}
+		_ = json.NewEncoder(w).Encode(a.events)
+		return true
 	case r.Method == http.MethodPost && path == "/repos/acme/widget/git/refs":
 		var body struct {
 			Ref string `json:"ref"`
@@ -129,6 +138,16 @@ func (a *adoptAPI) setCommitAuthor(sha, login string) {
 	a.commits[sha] = login
 }
 
+func (a *adoptAPI) setPushActor(sha, before, actor string, at time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.events = []map[string]any{{
+		"type": "PushEvent", "actor": map[string]any{"login": actor},
+		"created_at": at.Format(time.RFC3339),
+		"payload":    map[string]any{"head": sha, "before": before, "ref": "refs/heads/fix-widget"},
+	}}
+}
+
 func (a *adoptAPI) setSuperseder(n int, state string, merged bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -138,6 +157,7 @@ func (a *adoptAPI) setSuperseder(n int, state string, merged bool) {
 func adoptPR(number int, head string, labels ...string) *gh.PullRequest {
 	pr := nudgePR(number, head, labels...)
 	pr.Base = &gh.PullRequestBranch{Ref: gh.Ptr("v5")}
+	pr.Head.Ref = gh.Ptr("fix-widget")
 	pr.Head.Repo = &gh.Repository{FullName: gh.Ptr("mallory/widget")}
 	pr.Body = gh.Ptr("Fixes the widget.\n\nCloses #12\nfixes #13\n\n— hive: backend=pi model=gpt-6\n")
 	return pr
@@ -606,6 +626,7 @@ func TestAdoptionInPlaceWhenMaintainerCanModify(t *testing.T) {
 
 	// The hive's fixer pushes: still red, adoption follows the new head, no churn.
 	h.adopt.setCommitAuthor("bbb", testHiveAppBotLogin)
+	h.adopt.setPushActor("bbb", "aaa", testHiveAppBotLogin, h.clock.at)
 	h.api.reset()
 	h.clock.advance(time.Minute)
 	h.observe(adoptPR(7, "bbb", adopted...), "check-failing:unit")
@@ -616,9 +637,10 @@ func TestAdoptionInPlaceWhenMaintainerCanModify(t *testing.T) {
 		t.Fatalf("adoption did not follow the hive's head: %+v", rec)
 	}
 
-	// A fixer agent pushes with a bare git identity (no GitHub login): that
-	// is the hive's work too, not the contributor returning.
+	// A fixer uses a bare git identity, but its authenticated App push
+	// still establishes ownership independently of that identity.
 	h.adopt.setCommitAuthor("bb2", "git:scanner")
+	h.adopt.setPushActor("bb2", "bbb", testHiveAppBotLogin, h.clock.at)
 	h.api.reset()
 	h.clock.advance(time.Minute)
 	h.observe(adoptPR(7, "bb2", adopted...), "check-failing:unit")
@@ -687,6 +709,7 @@ func TestAdoptionPersistsWhileHiveOwnsThePR(t *testing.T) {
 
 	// The hive's fixer pushes and CI is pending: still 074, nothing written.
 	h.adopt.setCommitAuthor("bbb", testHiveAppBotLogin)
+	h.adopt.setPushActor("bbb", "aaa", testHiveAppBotLogin, h.clock.at)
 	h.api.reset()
 	h.clock.advance(time.Minute)
 	h.observe(adoptPR(7, "bbb", adopted...), "check-pending")
@@ -762,6 +785,87 @@ func TestAdoptionPersistsWhileHiveOwnsThePR(t *testing.T) {
 	}
 	if rec, _ := h.e.stageStoreOrShared().Get(key); rec.AdoptedInPlace() || rec.YieldedHead != "ccc" {
 		t.Fatalf("adoption not released: %+v", rec)
+	}
+}
+
+// Commit metadata cannot keep stage/074: even a linked App identity may be
+// supplied by a contributor. Only a matching, authenticated push can keep it.
+func TestAdoptionYieldsWithoutAuthenticatedAppPush(t *testing.T) {
+	for _, reason := range []string{"check-failing:unit", "check-pending", contributorLaneReasonNoVerdict} {
+		for _, tc := range []struct {
+			name     string
+			identity string
+			alter    func(*adoptAPI)
+		}{
+			{name: "unlinked scanner", identity: "git:scanner"},
+			{name: "unrelated login", identity: "someone-else"},
+			{name: "forged app login", identity: testHiveAppBotLogin},
+			{name: "commit unavailable"},
+			{name: "contributor pushed app commit", identity: testHiveAppBotLogin, alter: func(a *adoptAPI) {
+				a.events[0]["actor"] = map[string]any{"login": "mallory"}
+			}},
+			{name: "different ref", alter: func(a *adoptAPI) {
+				a.events[0]["payload"].(map[string]any)["ref"] = "refs/heads/other"
+			}},
+			{name: "different head", alter: func(a *adoptAPI) {
+				a.events[0]["payload"].(map[string]any)["head"] = "other"
+			}},
+			{name: "different before", alter: func(a *adoptAPI) {
+				a.events[0]["payload"].(map[string]any)["before"] = "other"
+			}},
+			{name: "predates adoption", alter: func(a *adoptAPI) {
+				a.events[0]["created_at"] = "2020-01-01T00:00:00Z"
+			}},
+			{name: "events unavailable", alter: func(a *adoptAPI) { a.eventsStatus = http.StatusForbidden }},
+			{name: "malformed event", alter: func(a *adoptAPI) { a.events[0]["payload"] = "invalid" }},
+			{name: "latest push is contributor", alter: func(a *adoptAPI) {
+				a.events = append([]map[string]any{{"type": "PushEvent", "actor": map[string]any{"login": "mallory"},
+					"payload": map[string]any{"ref": "refs/heads/fix-widget", "head": "ccc", "before": "bbb"}}}, a.events...)
+			}},
+		} {
+			t.Run(reason+"/"+tc.name, func(t *testing.T) {
+				p := adoptPolicy()
+				p.AdoptInPlace = true
+				h, done := newAdoptHarness(t, ContributorNudgeOutcome{Mode: "comment"}, p)
+				defer done()
+				h.adopt.allowMaintainerEdits(7, true)
+				h.observe(adoptPR(7, "aaa"), "check-failing:unit")
+				h.clock.advance(30 * time.Minute)
+				h.observe(adoptPR(7, "aaa", "stage/072-returned-to-contributor"), "check-failing:unit")
+				key := stageKey("acme", "widget", 7)
+				if rec, _ := h.e.stageStoreOrShared().Get(key); !rec.AdoptedInPlace() {
+					t.Fatal("not adopted")
+				}
+				if tc.identity != "" {
+					h.adopt.setCommitAuthor("bbb", tc.identity)
+				}
+				if tc.alter != nil {
+					h.adopt.setPushActor("bbb", "aaa", testHiveAppBotLogin, h.clock.at)
+					tc.alter(h.adopt)
+				}
+				h.api.reset()
+				h.observe(adoptPR(7, "bbb", "stage/074-adopted-by-hive"), reason)
+				if rec, _ := h.e.stageStoreOrShared().Get(key); rec.AdoptedInPlace() || rec.YieldedHead != "bbb" || rec.Stage == stagelabels.AdoptedByHive {
+					t.Fatalf("unattributed head kept ownership: %+v", rec)
+				}
+				yields := 0
+				for _, comment := range h.api.comments {
+					if strings.HasPrefix(comment, AdoptionYieldMarker) {
+						yields++
+					}
+				}
+				if yields != 1 {
+					t.Fatalf("yield comments=%d, want 1", yields)
+				}
+				h.api.reset()
+				h.observe(adoptPR(7, "bbb"), reason)
+				for _, comment := range h.api.comments {
+					if strings.HasPrefix(comment, AdoptionYieldMarker) {
+						t.Fatal("repeated yield")
+					}
+				}
+			})
+		}
 	}
 }
 

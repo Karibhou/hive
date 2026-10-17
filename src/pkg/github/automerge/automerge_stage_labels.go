@@ -239,6 +239,7 @@ type stageObservation struct {
 	Body    string
 	// HeadRepo is the head's owner/repo (differs from Display on a fork).
 	HeadRepo string
+	HeadRef  string
 	// Route is set by ApplyStageLabels when the lane handed the PR to a
 	// human and the evidence routed it (feeds the entry comments and the
 	// 072 nudge diagnosis).
@@ -394,6 +395,7 @@ func (c *Engine) recordStage(lane, displayRepo, owner, repo string, pr *gh.PullR
 	}
 	if pr.GetHead() != nil {
 		obs.HeadSHA = pr.GetHead().GetSHA()
+		obs.HeadRef = pr.GetHead().GetRef()
 	}
 	if pr.GetHead() != nil && pr.GetHead().GetRepo() != nil {
 		obs.HeadRepo = pr.GetHead().GetRepo().GetFullName()
@@ -1064,7 +1066,7 @@ func (c *Engine) ApplyStageLabels(ctx context.Context) (StageLabelResult, error)
 		} else {
 			if hadPrev && prevRec.AdoptedInPlace() {
 				// In-place adoption: a head the hive pushed keeps the
-				// adoption; a head the contributor pushed yields it.
+				// adoption; an unattributed head change releases it.
 				// Settled on every head change whatever the lane sees —
 				// the hive's fix going green must not hide the yield.
 				n, err := c.settleInPlaceAdoption(ctx, store, key, obs, prevRec)

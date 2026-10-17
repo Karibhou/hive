@@ -1,0 +1,1 @@
+- In-place PR adoption now follows authenticated App push events instead of forgeable commit identities; changed heads without matching push evidence return to the ordinary pipeline (#12744).
