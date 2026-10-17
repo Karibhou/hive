@@ -421,9 +421,11 @@ type EvidenceMissing struct {
 	PRsOutcomeUnknown int  `json:"prs_outcome_unknown"`
 	RecordsUnreadable int  `json:"records_unreadable"`
 	ReviewerAccuracy  bool `json:"reviewer_accuracy_unavailable"`
-	// IssuesHumanOpensUnobserved is always true today: the audit log only
-	// records hive-mediated issue writes, so issues humans or third-party bots
-	// open directly on GitHub never reach work_balance.
+	// IssuesHumanOpensUnobserved is true while some work_balance row relies on
+	// the audit log for issues: the audit log only records hive-mediated issue
+	// writes, so issues humans or third-party bots open directly on GitHub
+	// never reach those rows. It clears once the GitHub rollup exists, or when
+	// the historical issue series covers every row and none fell back to audit.
 	IssuesHumanOpensUnobserved bool `json:"issues_human_opens_unobserved"`
 	// ThrottleWindows is always true today: this hive reports no governor
 	// issue-creation throttle windows, so work_balance carries no shading.
