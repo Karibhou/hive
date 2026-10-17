@@ -47,7 +47,7 @@ func TestValidateGitSourceURL_RejectsPrivateHosts(t *testing.T) {
 }
 
 func TestValidateGitSourceURL_AllowsPublicHosts(t *testing.T) {
-	stubPublicGitSourceDNS(t)
+	stubPublicGitSourceDNS(t, "github.com", "gitlab.com")
 	ok := []string{
 		"https://github.com/hivecommons/hive.git",
 		"https://gitlab.com/group/project.git",
