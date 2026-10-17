@@ -9,7 +9,27 @@ import (
 	"testing"
 )
 
+// stubPublicGitSourceDNS keeps validation unit tests independent of external DNS.
+// Like the existing SSRF resolver tests, callers must remain non-parallel because
+// gitSourceResolver is package-global; cleanup restores it before the next test.
+func stubPublicGitSourceDNS(t *testing.T) {
+	t.Helper()
+	t.Setenv("HIVE_ALLOW_PRIVATE_GIT_SOURCE", "")
+	orig := gitSourceResolver
+	gitSourceResolver = func(_ context.Context, host string) ([]string, error) {
+		switch host {
+		case "github.com", "gitlab.com":
+			return []string{"8.8.8.8"}, nil
+		default:
+			t.Fatalf("unexpected git source DNS lookup: %q", host)
+			return nil, nil
+		}
+	}
+	t.Cleanup(func() { gitSourceResolver = orig })
+}
+
 func TestValidateGitSourceURL(t *testing.T) {
+	stubPublicGitSourceDNS(t)
 	tests := []struct {
 		name    string
 		raw     string
@@ -135,6 +155,7 @@ func TestGitSourceInitRejectsInvalidURL(t *testing.T) {
 }
 
 func TestGitSourceInitRejectsFlagLikeBranch(t *testing.T) {
+	stubPublicGitSourceDNS(t)
 	cloneDir := t.TempDir()
 	initGitRepo(t, cloneDir)
 	gs := NewGitSource(GitSourceConfig{
