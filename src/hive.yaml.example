@@ -494,6 +494,8 @@ governor:
       #   enabled: true                 # default true; false leaves the PR in stage/072
       #   in_place: true                # default true; push to the original branch when GitHub permits
       #                                 # otherwise supersede with an App PR retaining the author's commits
+      #   strict_attribution: true      # default true; changed in-place heads keep ownership only when
+      #                                 # GitHub links their commits to the App bot (fail closed)
       #   after_offline: 15m            # default 15m; registered relay offline, measured from the later
       #                                 # of its last heartbeat and the first stage/072 nudge
       #   after_unregistered: 15m       # default 15m; no contributor profile, wait after the nudge with no new head
