@@ -19,9 +19,8 @@ import (
 //
 //   - issues: the GitHub-truth rollup the metrics collector keeps under
 //     /data (every author, every issue updated in the lookback); weeks that
-//     start before the rollup's coverage fall back to the audit log, which
-//     only saw hive-mediated issue writes, and are marked issue_source
-//     "audit".
+//     start before the rollup's coverage use the backfilled issue series,
+//     with an audit fallback (issue_source "audit") where it lacks coverage.
 //   - prs: the folded evidence bundles (live + backfilled), by PR open time,
 //     merge time and close time.
 //   - queue: the governor's hive-state snapshots (actionable open issues and
@@ -67,7 +66,7 @@ type EvidenceWorkBalanceWeek struct {
 type EvidenceWorkBalanceSources struct {
 	// IssuesGitHubSince is the start of complete GitHub-truth issue coverage
 	// (RFC3339); empty when the rollup has never been written. Weeks before
-	// it are audit-only.
+	// it may use the historical issue series or the audit fallback.
 	IssuesGitHubSince string `json:"issues_github_since,omitempty"`
 	// IssuesFetchedAt is the rollup's last successful refresh.
 	IssuesFetchedAt string `json:"issues_fetched_at,omitempty"`
@@ -76,6 +75,8 @@ type EvidenceWorkBalanceSources struct {
 	// AuditOnlyWeeks is how many rows in the response fell back to the audit
 	// log for issues.
 	AuditOnlyWeeks int `json:"audit_only_weeks"`
+	// IssueSeriesWeeks counts repo-weeks supplied by the historical issue series.
+	IssueSeriesWeeks int `json:"issue_series_weeks"`
 	// QueueSamples is how many governor samples supplied week-end depths;
 	// QueueRetentionDays is how far back the snapshots are kept.
 	QueueSamples       int `json:"queue_samples"`
@@ -101,6 +102,7 @@ type evidenceWorkBalanceInputs struct {
 	Rollup  IssueActivityRollup
 	PRs     map[string]*evidence.PR
 	Buckets []hivestate.Bucket
+	Series  []evidenceIssueSeriesWeek
 }
 
 func evidenceWeekKey(t time.Time) string {
@@ -159,6 +161,50 @@ func buildEvidenceWorkBalance(in evidenceWorkBalanceInputs, win evidenceWindow, 
 	githubWeek := func(t time.Time) bool {
 		return !githubSince.IsZero() && !evidenceWeekStart(t).Before(githubSince)
 	}
+	// The collector remains authoritative for every week it fully covers.
+	// Backfills replace audit data per repository, never an entire mixed row.
+	seriesWeeks := map[string]bool{}
+	for _, series := range in.Series {
+		w := series.IssueWeek
+		if repo != "" && !strings.EqualFold(series.Repo, repo) {
+			continue
+		}
+		start := evidenceWeekStart(w.CoveredFrom)
+		end := start.AddDate(0, 0, 7)
+		if githubWeek(start) || evidenceWeekKey(start) != w.Week {
+			continue
+		}
+		if (win.Custom || win.Hours > 0) && win.From.After(start) {
+			start = win.From
+		}
+		if !win.To.IsZero() && win.To.Before(end) {
+			end = win.To
+		}
+		if !end.After(start) || w.CoveredFrom.After(start) || w.CoveredTo.Before(end) {
+			continue
+		}
+		key := strings.ToLower(series.Repo) + "/" + w.Week
+		if seriesWeeks[key] {
+			continue
+		}
+		seriesWeeks[key] = true
+		src.IssueSeriesWeeks++
+		r := row(start) // Zero-event files still establish observed coverage.
+		r.IssueSource = evidenceWorkBalanceSourceGitHub
+		for _, event := range w.Events {
+			if evidenceWeekKey(event.At) != w.Week || event.At.Before(w.CoveredFrom) || !event.At.Before(w.CoveredTo) || !evidenceWindowHasTime(win, event.At) {
+				continue
+			}
+			switch event.Action {
+			case "opened":
+				r.Opened[event.Kind]++
+				r.N++
+			case "closed":
+				r.Closed++
+				r.N++
+			}
+		}
+	}
 	// Audit-created issue numbers are the agent's own work even when the
 	// hive's App account is the GitHub author.
 	agentIssues := map[string]bool{}
@@ -205,7 +251,12 @@ func buildEvidenceWorkBalance(in evidenceWorkBalanceInputs, win evidenceWindow, 
 		if !ok || !prThroughputEntryMatchesRepo(e, repo) || !evidenceWindowHasTime(win, t) || githubWeek(t) {
 			continue
 		}
+		if r, ok := auditEntryRepo(e); ok && seriesWeeks[strings.ToLower(r)+"/"+evidenceWeekKey(t)] {
+			continue
+		}
 		r := row(t)
+		// A row may mix backfilled repositories with audit-only ones.
+		r.IssueSource = evidenceWorkBalanceSourceAudit
 		r.N++
 		if kind, ok := evidenceWorkBalanceOpenerKind(e); ok {
 			r.Opened[kind]++

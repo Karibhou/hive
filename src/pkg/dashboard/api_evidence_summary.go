@@ -551,10 +551,11 @@ func (s *Server) handleEvidenceSummary(w http.ResponseWriter, r *http.Request) {
 	resp.WorkBalance, resp.WorkBalanceSources = buildEvidenceWorkBalance(evidenceWorkBalanceInputs{
 		Entries: evidenceWorkBalanceEntries(s.audit),
 		Rollup:  loadIssueActivityRollup(issueActivityPath),
+		Series:  loadEvidenceIssueSeries(ghpkg.ReviewEvidenceRoot),
 		PRs:     evidence.FoldPRs(bundles, repo, ""),
 		Buckets: s.evidenceWorkBalanceBuckets(win),
 	}, win, repo)
-	resp.Missing.IssuesHumanOpensUnobserved = resp.WorkBalanceSources.IssuesGitHubSince == ""
+	resp.Missing.IssuesHumanOpensUnobserved = resp.WorkBalanceSources.IssuesGitHubSince == "" && (resp.WorkBalanceSources.IssueSeriesWeeks == 0 || resp.WorkBalanceSources.AuditOnlyWeeks > 0)
 	resp.WriteActivity = buildEvidenceWriteActivity(writeCountersPath, evidenceWriteActivityEntries(s.audit), win, repo, now)
 	allPRs := evidence.FoldPRs(bundles, "", "")
 	resp.CIRecovery = buildEvidenceCIRecovery(evidenceCIClaims(bundles, allPRs), evidenceGateMerges(bundles, allPRs), loadCIRecoveryRollup(ciRecoveryPath), win, repo, evidenceCIPolicy(s))
@@ -593,9 +594,10 @@ func loadEvidenceBundles(root string) ([]*evidence.Bundle, int, error) {
 			return err
 		}
 		if d.IsDir() {
-			// Monthly complexity snapshots (#12363) share the root but are
-			// not review bundles.
-			if d.Name() == complexity.DirName && path != root {
+			// Reporting series share the root but are not review bundles.
+			rel, _ := filepath.Rel(root, path)
+			issueSeries := d.Name() == "issues" && len(strings.Split(rel, string(filepath.Separator))) == 3
+			if (d.Name() == complexity.DirName || issueSeries) && path != root {
 				return filepath.SkipDir
 			}
 			return nil
