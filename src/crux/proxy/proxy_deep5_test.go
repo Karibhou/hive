@@ -517,6 +517,7 @@ func TestStartInferenceTranslatorTranslationError(t *testing.T) {
 		certCache:  make(map[string]cachedCert),
 		inference:  newInferenceRouter(),
 	}
+	p.proxyAdvisoryOK = true // no UID map in tests; accept the x-api-key identity (#14439)
 	p.inference.Set("agent-bad-resp", &InferenceRoute{Backend: "vllm", Endpoint: mock.URL, Model: "test"})
 
 	translator := httptest.NewServer(p.inferenceTranslatorHandler())
