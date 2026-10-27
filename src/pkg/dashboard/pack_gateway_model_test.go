@@ -190,6 +190,7 @@ func TestApplyPackKeepsPackBackendWhenGatewayNotShared(t *testing.T) {
 	}{
 		{"agents disagree on the gateway", []string{"litellm", "vllm"}, nil},
 		{"no agent on a gateway", []string{"claude"}, nil},
+		{"one agent on a gateway, the rest on a CLI", []string{"litellm", "copilot"}, nil},
 		{"operator picked copilot", []string{"litellm"}, &config.AgentConfig{
 			ID: "reviewer", Role: "reviewer", Enabled: true,
 			Backend: "copilot", BackendOwner: config.FieldOwnerOperator,
@@ -211,5 +212,31 @@ func TestApplyPackKeepsPackBackendWhenGatewayNotShared(t *testing.T) {
 				t.Errorf("reviewer backend = %q, want the pack's copilot", got)
 			}
 		})
+	}
+}
+
+// TestApplyPackDoesNotMigrateFleetForOneGatewayAgent: an operator who moved a
+// single agent onto a gateway has not moved the hive, so the pack-owned CLI
+// agents stay where the pack put them (#14678 review).
+func TestApplyPackDoesNotMigrateFleetForOneGatewayAgent(t *testing.T) {
+	srv := newFullServer(t)
+	for _, name := range []string{"scanner", "quality"} {
+		srv.deps.Config.Agents[name] = config.AgentConfig{
+			ID: name, Role: name, Enabled: true,
+			Backend: "copilot", BackendOwner: config.FieldOwnerPack,
+			Model: "claude-fable-5", ModelOwner: config.FieldOwnerPack,
+		}
+	}
+	srv.deps.Config.Agents["guide"] = config.AgentConfig{
+		ID: "guide", Role: "guide", Enabled: true,
+		Backend: "litellm", BackendOwner: config.FieldOwnerOperator,
+	}
+	if _, err := srv.ApplyPack(2); err != nil {
+		t.Fatalf("ApplyPack(2): %v", err)
+	}
+	for _, name := range []string{"scanner", "quality", "reviewer"} {
+		if got := srv.deps.Config.Agents[name].Backend; got != "copilot" {
+			t.Errorf("%s backend = %q, want the pack's copilot: one gateway agent is not the hive's gateway", name, got)
+		}
 	}
 }

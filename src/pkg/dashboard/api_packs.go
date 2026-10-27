@@ -149,7 +149,7 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 	var readded []string
 	// Read once, before this apply creates or moves anything, so the
 	// gateway the operator chose is judged on their agents alone.
-	hiveGateway := s.hiveGatewayBackend()
+	hiveBackends := s.hiveAgentBackends()
 	for _, pa := range pack.Agents {
 		// A deliberately deleted agent is NOT re-created, at any level. The
 		// pack listing it is exactly why deletion did not stick: ApplyPack
@@ -211,7 +211,7 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 			// A pack agent still sitting on the CLI the pack gave it follows
 			// the hive's gateway (#14678). Only a backend the pack itself
 			// wrote moves — never an operator's pick, nor a legacy unowned one.
-			if gw := gatewayPlacement(packBackend, backendReplaced, hiveGateway); gw != "" &&
+			if gw := gatewayPlacement(packBackend, backendReplaced, s.hiveGatewayBackend(hiveBackends, pa.Name)); gw != "" &&
 				existing.BackendOwner == config.FieldOwnerPack && strings.EqualFold(existing.Backend, packBackend) {
 				s.logger.Info("moving pack-owned agent onto the hive's inference gateway",
 					"agent", pa.Name, "backend", existing.Backend, "gateway", gw)
@@ -388,7 +388,7 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 		}
 		// The pack model is an id from the pack CLI's catalogue; on the
 		// gateway it is cleared so the gateway's default_model applies (#9945).
-		if gw := gatewayPlacement(packBackend, backendReplaced, hiveGateway); gw != "" {
+		if gw := gatewayPlacement(packBackend, backendReplaced, s.hiveGatewayBackend(hiveBackends, pa.Name)); gw != "" {
 			packBackend = gw
 			packModel = ""
 		}
@@ -1151,24 +1151,40 @@ func (s *Server) packAgentBackend(pa config.PackAgent) (backend string, replaced
 	return s.deps.Config.Backends.Fallback(), true
 }
 
-// hiveGatewayBackend is the inference gateway the hive's existing agents agree
-// on: the one backend shared by every enabled agent that routes through an
-// inference backend or configured gateway, or "" when none does or they
-// disagree. Agents on subscription CLIs do not count either way.
+// hiveAgentBackends snapshots the backend of every enabled agent, keyed by
+// name, for hiveGatewayBackend.
+func (s *Server) hiveAgentBackends() map[string]string {
+	backends := map[string]string{}
+	for name, agent := range s.deps.Config.Agents {
+		if !agent.Enabled || s.deps.Config.IsAgentRemoved(name) {
+			continue
+		}
+		backends[name] = strings.TrimSpace(agent.Backend)
+	}
+	return backends
+}
+
+// hiveGatewayBackend is the inference gateway the whole hive already runs on:
+// the one backend shared by every enabled agent other than except, each of
+// which must route through an inference backend or configured gateway. It is
+// "" when any of them sits on a subscription CLI or the hive default, when
+// they disagree, or when there are none. except is the pack agent being
+// placed, so its own pack CLI placement is not counted against the move.
 //
 // A pack agent a level adds later is placed on this backend instead of its
 // pack CLI (#14678): an operator who moved scanner/quality/guide onto a LiteLLM
 // gateway found the L2 `reviewer`, added afterwards, on copilot — the only
 // agent in the hive still calling an inference provider they had moved off.
-func (s *Server) hiveGatewayBackend() string {
+// Requiring every other agent to agree keeps one agent moved onto a gateway
+// from migrating the pack's CLI agents with it.
+func (s *Server) hiveGatewayBackend(backends map[string]string, except string) string {
 	shared := ""
-	for name, agent := range s.deps.Config.Agents {
-		if !agent.Enabled || s.deps.Config.IsAgentRemoved(name) {
+	for name, backend := range backends {
+		if strings.EqualFold(name, except) {
 			continue
 		}
-		backend := strings.TrimSpace(agent.Backend)
 		if !s.agentOnForeignGatewayBackend(backend, "") {
-			continue
+			return ""
 		}
 		if shared != "" && !strings.EqualFold(shared, backend) {
 			return ""
