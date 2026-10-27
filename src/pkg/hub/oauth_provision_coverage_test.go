@@ -89,6 +89,7 @@ func TestHandleOAuthCallbackSuccess(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/callback?code=abc&state="+url.QueryEscape(nonce+oauthStateSeparator+"/my-hives"), nil)
 	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: nonce})
+	addPKCECookie(t, req)
 	s.handleOAuthCallback(rec, req)
 	if rec.Code != http.StatusTemporaryRedirect {
 		t.Fatalf("success status = %d, want 307 (body=%s)", rec.Code, rec.Body.String())
@@ -344,6 +345,7 @@ func newCallbackRequestWithState(t *testing.T, code string) *http.Request {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/callback?code="+code+"&state="+url.QueryEscape(nonce+oauthStateSeparator+"/dashboard"), nil)
 	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: nonce})
+	addPKCECookie(t, req)
 	return req
 }
 
