@@ -148,8 +148,10 @@ type openPRIndex struct {
 }
 
 // openPRIndex builds the index from the hub server's current status. A repo
-// whose counts are incomplete, stale or carry unlisted PRs is left out: a PR
-// missing from a partial listing is not evidence that it closed.
+// whose rows cannot vouch for a departure (ownershipRowsComplete: counts
+// incomplete, paused, or never enumerated), or whose counts are stale or carry
+// unlisted PRs, is left out: a PR missing from such a listing is not evidence
+// that it closed.
 func (h *ContributeWSHub) openPRIndex() openPRIndex {
 	var idx openPRIndex
 	if h == nil || h.server == nil {
@@ -163,7 +165,7 @@ func (h *ContributeWSHub) openPRIndex() openPRIndex {
 	}
 	idx.repos, idx.prs = map[string]bool{}, map[string]bool{}
 	for _, repo := range status.Repos {
-		if repo.CountsIncomplete || repo.CountsStale || repo.UnlistedPRs > 0 {
+		if !ownershipRowsComplete(repo) || repo.CountsStale || repo.UnlistedPRs > 0 {
 			continue
 		}
 		full := nonEmpty(repo.Full, repo.Name)

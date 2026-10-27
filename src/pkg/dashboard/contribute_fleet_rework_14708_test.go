@@ -72,7 +72,11 @@ func TestFleetReworkIncompleteListingKeepsRecords(t *testing.T) {
 		"incomplete": {Name: "r", Full: "org/r", CountsIncomplete: true},
 		"stale":      {Name: "r", Full: "org/r", CountsStale: true},
 		"unlisted":   {Name: "r", Full: "org/r", UnlistedPRs: 1},
-		"other repo": {Name: "q", Full: "org/q"},
+		"paused":     {Name: "r", Full: "org/r", Paused: true},
+		// Pre-scan shape: built before the first eval cycle (no actionable
+		// snapshot), so no counts or item lists are set at all.
+		"never enumerated": {Name: "r", Full: "org/r", ownershipDataMissing: true},
+		"other repo":       {Name: "q", Full: "org/q"},
 	}
 	for name, repo := range cases {
 		t.Run(name, func(t *testing.T) {
