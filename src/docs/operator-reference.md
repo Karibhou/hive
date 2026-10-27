@@ -1226,8 +1226,9 @@ v5 and v6 spokes) tracking one repo all stay on webhook mode.
   the loop runs a cached-snapshot cycle now instead of waiting for an
   unrelated delivery or `governor.eval_interval_webhook_s`. Advisory verdicts
   do not wake it. The first verdict wakes at once; later ones inside
-  `governor.webhook_wake_min_gap_s` fold into one wake at the end of the gap,
-  and the spoke logs `review verdict wake: running an early eval cycle from
+  `governor.webhook_wake_min_gap_s` fold into one wake at the end of the gap.
+  `governor.webhook_wake_debounce_s` does not apply to this wake (its
+  debounce is fixed at 0, so a verdict is never held back), and the spoke logs `review verdict wake: running an early eval cycle from
   the cached snapshot`
   ([#14705](https://github.com/hivecommons/hive/issues/14705)).
 - Every status publish (cadence or wake) invalidates the `/api/stage-tracker`
