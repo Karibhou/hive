@@ -243,11 +243,12 @@ func enforceHoldGuard(
 //
 // For each PR the guard is already tracking, a "behind" or "dirty" state gets
 // one merge-from-base attempt via UpdateBranchExpectedHead, pinned to the
-// enumerated head and using the hive's own identity. On success the result is hygiene, not reviewable content, so the
-// guard's baseline is advanced to the new head (holdguard.AdvanceHygiene) —
-// this is what keeps the next lift check from reading the hive's own upkeep
-// push as drift. The advance requires proof that the new head IS that merge
-// (holdguard.IsHygieneMerge: first parent is the requested head, second is a
+// enumerated head and using the hive's own identity. On success the result
+// is hygiene, not reviewable content, so the guard's baseline is advanced to
+// the new head (holdguard.AdvanceHygiene) — this is what keeps the next lift
+// check from reading the hive's own upkeep push as drift. The advance
+// requires proof that the new head IS that merge (holdguard.IsHygieneMerge:
+// first parent is the requested head, second is a
 // commit on the base branch — the enumerated BaseSHA, or one the live base
 // contains when the base moved before the update ran); a head that moved any
 // other way stays unadopted and reads as drift. On
