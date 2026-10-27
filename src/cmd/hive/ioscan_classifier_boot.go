@@ -43,10 +43,14 @@ const ioscanClassifierBlockedAlertID = "ioscan-classifier-blocked"
 // be built: withheld text at fail-closed, no classifier at fail-open. When
 // the classifier is fail-closed and cannot run, a persistent dashboard alert
 // says that kicks are being blocked and how to fix it; the alert is cleared
-// on a boot where the classifier runs or is not required.
+// on a successful score or a boot where the classifier runs or is not required.
 func installIoscanClassifier(sched ioscanClassifierSink, alerts ioscanClassifierAlerter, cfg *config.Config, logger *slog.Logger, now func() time.Time) {
 	acmmLevel := cfg.ACMMLevelOrZero()
 	sched.SetClassifierUnavailableFunc(func(err error) {
+		if err == nil {
+			clearIoscanClassifierAlert(alerts)
+			return
+		}
 		raiseIoscanClassifierAlert(alerts, acmmLevel, err)
 	})
 	if !cfg.Ioscan.ClassifierEnabledAtLevel(acmmLevel) {

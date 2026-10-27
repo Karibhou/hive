@@ -297,4 +297,8 @@ func TestInstallIoscanClassifier_RuntimeUnavailableAlert(t *testing.T) {
 	if !ok || !strings.Contains(msg, "authentication failed") {
 		t.Fatalf("runtime alert = %q, present = %v", msg, ok)
 	}
+	sink.unavailable(nil)
+	if _, ok := alerts.blocked(); ok {
+		t.Fatal("runtime alert remains after successful score")
+	}
 }

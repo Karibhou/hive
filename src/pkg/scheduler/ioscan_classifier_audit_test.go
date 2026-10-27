@@ -471,3 +471,17 @@ func TestClassifierUnavailableCallback_NotForQuota(t *testing.T) {
 		t.Fatalf("quota exhaustion: callback = %v, text = %q", called, got)
 	}
 }
+
+func TestClassifierUnavailableCallback_Recovery(t *testing.T) {
+	s := newSchedulerWithIoscanFailMode(true, "closed")
+	classifier := &fakeInjectionClassifier{err: errors.New("runtime failure")}
+	s.SetClassifier(classifier, ioscan.Thresholds{})
+	var calls []error
+	s.SetClassifierUnavailableFunc(func(err error) { calls = append(calls, err) })
+	s.enforceIssueTextVerdict("ordinary issue text")
+	classifier.err = nil
+	s.enforceIssueTextVerdict("another ordinary issue")
+	if len(calls) != 2 || calls[0] == nil || calls[1] != nil {
+		t.Fatalf("callback errors = %v, want failure then recovery", calls)
+	}
+}

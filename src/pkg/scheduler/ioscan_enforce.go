@@ -272,6 +272,7 @@ func (s *Scheduler) enforceTextFrom(text string, src ioscan.Source) (string, ios
 		}
 		return sanitized, v
 	}
+	s.classifierUnavailable(nil)
 	action := ioscan.ActionForScore(score, thresholds, s.classifierFailClosed())
 	s.recordClassifierResult(score, action)
 	switch action {
@@ -415,6 +416,7 @@ func (s *Scheduler) IoscanHooksForTest() (audit AuditFunc, advisory AdvisoryFunc
 }
 
 // SetClassifierUnavailableFunc attaches an alert callback for runtime fail-closed errors.
+// A nil error signals a successful score and clears a prior runtime alert.
 func (s *Scheduler) SetClassifierUnavailableFunc(f func(error)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
