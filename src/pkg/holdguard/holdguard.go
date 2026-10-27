@@ -284,15 +284,21 @@ func (s *Store) ReArm(repo string, number int, headSHA string, commits []Commit)
 
 // IsHygieneMerge reports whether head is provably the merge-from-base the hive
 // asked for: a two-parent commit whose first parent is requestedHead (the head
-// the hive updated) and whose second parent is baseSHA (the base it merged
-// in). Anything else — a contributor push landing between the update request
-// and the refetch, a merge of some other branch, an unknown head or base —
-// is not proven hygiene and must not become the baseline (hivecommons/hive#14534).
-func IsHygieneMerge(head Commit, requestedHead, baseSHA string) bool {
-	if head.SHA == "" || requestedHead == "" || baseSHA == "" || len(head.Parents) != 2 {
+// the hive updated) and whose second parent is a commit on the base branch
+// (onBase). The second parent is checked for membership rather than equality
+// with one cached base SHA because update-branch merges the base tip at call
+// time, which may be newer than the tip seen at enumeration. Anything else — a
+// contributor push landing between the update request and the refetch, a merge
+// of some other branch, an unknown head — is not proven hygiene and must not
+// become the baseline (hivecommons/hive#14534).
+func IsHygieneMerge(head Commit, requestedHead string, onBase func(sha string) bool) bool {
+	if head.SHA == "" || requestedHead == "" || onBase == nil || len(head.Parents) != 2 {
 		return false
 	}
-	return head.Parents[0] == requestedHead && head.Parents[1] == baseSHA
+	if head.Parents[0] != requestedHead || head.Parents[1] == "" {
+		return false
+	}
+	return onBase(head.Parents[1])
 }
 
 // AdvanceHygiene moves a held PR's baseline forward to a head the hive itself

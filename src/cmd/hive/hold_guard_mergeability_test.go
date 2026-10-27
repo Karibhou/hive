@@ -88,7 +88,7 @@ func TestMaintainHeldPRMergeabilityKeepsBaselineWhenNewHeadIsNotTheHygieneMerge(
 				t.Fatal("test setup: snapshot must record")
 			}
 
-			held := heldPRsActionable(github.PullRequest{Repo: "widgets", Number: 7, HeadSHA: "c1", BaseSHA: "b1", MergeableState: "behind"})
+			held := heldPRsActionable(github.PullRequest{Repo: "widgets", Number: 7, HeadSHA: "c1", BaseSHA: "b1", BaseRef: "main", MergeableState: "behind"})
 			_ = enforceHoldGuard(context.Background(), cfg, client, client, held, discardLogger())
 
 			fake.mu.Lock()
@@ -103,6 +103,54 @@ func TestMaintainHeldPRMergeabilityKeepsBaselineWhenNewHeadIsNotTheHygieneMerge(
 			}
 			if drift := holdguard.Diff(rec, "c2", nil); !drift.Moved {
 				t.Fatal("the unproven head must still read as drift at lift time")
+			}
+		})
+	}
+}
+
+// #14534 review: update-branch merges the base tip at call time, which may be
+// newer than the enumerated BaseSHA, and the polling enumeration may not carry
+// a BaseSHA at all. The hive's own merge must still advance the baseline when
+// the live base branch contains the merged parent.
+func TestMaintainHeldPRMergeabilityAdvancesWhenMergedBaseIsNewerThanEnumerated(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseSHA string
+	}{
+		{"base moved after enumeration", "b1"},
+		{"base SHA not enumerated", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestHoldGuardStore(t)
+			fake := &holdGuardServer{
+				commits: map[int][]map[string]any{
+					7: {ghCommit("c1", "strategist-bot", "docs: plan"), ghMergeCommit("c2", "hive-bot", "Merge branch 'main' into feature", "c1", "b2")},
+				},
+				baseContains: map[string]bool{"b1": true, "b2": true},
+			}
+			client := newHoldGuardClient(t, fake)
+			cfg := escalationTestConfig()
+			if !store.Snapshot("acme/widgets", 7, "c1", []holdguard.Commit{{SHA: "c1", Author: "strategist-bot"}}) {
+				t.Fatal("test setup: snapshot must record")
+			}
+
+			held := heldPRsActionable(github.PullRequest{Repo: "widgets", Number: 7, HeadSHA: "c1", BaseSHA: tt.baseSHA, BaseRef: "main", MergeableState: "behind"})
+			if got := enforceHoldGuard(context.Background(), cfg, client, client, held, discardLogger()); len(got) != 0 {
+				t.Fatalf("keeping a held PR mergeable must not flag it for re-review, got %v", got)
+			}
+			rec, ok := store.Recorded("acme/widgets", 7)
+			if !ok || rec.HeadSHA != "c2" {
+				t.Fatalf("baseline = %+v ok=%v, want it advanced to the hive's merge c2", rec, ok)
+			}
+			fake.mu.Lock()
+			compares := fake.compareCalls
+			fake.mu.Unlock()
+			if compares != 1 {
+				t.Fatalf("compare calls = %d, want 1 live base-membership check", compares)
+			}
+			if len(fake.comments) != 0 {
+				t.Fatalf("a successful hygiene push must not comment, saw %v", fake.comments)
 			}
 		})
 	}
