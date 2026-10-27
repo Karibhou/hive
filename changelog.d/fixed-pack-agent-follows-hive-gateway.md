@@ -1,0 +1,1 @@
+- A pack agent that an ACMM level adds to a hive whose agents all run on one inference gateway (e.g. the L2 `reviewer` on a LiteLLM hive) now joins that gateway with its default model instead of the pack's Copilot CLI, and an already-created pack-owned agent is moved there on the next restart (#14678).

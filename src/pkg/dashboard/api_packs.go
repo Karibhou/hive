@@ -147,6 +147,9 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 	// the manager's process table and were re-registered. A repair, not a
 	// creation — it never feeds `created` or isFirstApplyOrExpansion (#5632).
 	var readded []string
+	// Read once, before this apply creates or moves anything, so the
+	// gateway the operator chose is judged on their agents alone.
+	hiveGateway := s.hiveGatewayBackend()
 	for _, pa := range pack.Agents {
 		// A deliberately deleted agent is NOT re-created, at any level. The
 		// pack listing it is exactly why deletion did not stick: ApplyPack
@@ -205,6 +208,19 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 			// stick. A pack-owned model is cleared there instead, so the
 			// gateway default applies.
 			packBackend, backendReplaced := s.packAgentBackend(pa)
+			// A pack agent still sitting on the CLI the pack gave it follows
+			// the hive's gateway (#14678). Only a backend the pack itself
+			// wrote moves — never an operator's pick, nor a legacy unowned one.
+			if gw := gatewayPlacement(packBackend, backendReplaced, hiveGateway); gw != "" &&
+				existing.BackendOwner == config.FieldOwnerPack && strings.EqualFold(existing.Backend, packBackend) {
+				s.logger.Info("moving pack-owned agent onto the hive's inference gateway",
+					"agent", pa.Name, "backend", existing.Backend, "gateway", gw)
+				existing.Backend = gw
+				if !existing.ModelIsOperatorOwned() {
+					existing.Model = ""
+				}
+				changed = true
+			}
 			onForeignGateway := s.agentOnForeignGatewayBackend(existing.Backend, packBackend)
 			packModel := pa.Model
 			// A hand-set backend other than the pack's (an operator-owned
@@ -368,6 +384,12 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 		packBackend, backendReplaced := s.packAgentBackend(pa)
 		packModel := pa.Model
 		if backendReplaced {
+			packModel = ""
+		}
+		// The pack model is an id from the pack CLI's catalogue; on the
+		// gateway it is cleared so the gateway's default_model applies (#9945).
+		if gw := gatewayPlacement(packBackend, backendReplaced, hiveGateway); gw != "" {
+			packBackend = gw
 			packModel = ""
 		}
 		agentCfg := config.AgentConfig{
@@ -1127,4 +1149,45 @@ func (s *Server) packAgentBackend(pa config.PackAgent) (backend string, replaced
 		return pa.Backend, false
 	}
 	return s.deps.Config.Backends.Fallback(), true
+}
+
+// hiveGatewayBackend is the inference gateway the hive's existing agents agree
+// on: the one backend shared by every enabled agent that routes through an
+// inference backend or configured gateway, or "" when none does or they
+// disagree. Agents on subscription CLIs do not count either way.
+//
+// A pack agent a level adds later is placed on this backend instead of its
+// pack CLI (#14678): an operator who moved scanner/quality/guide onto a LiteLLM
+// gateway found the L2 `reviewer`, added afterwards, on copilot — the only
+// agent in the hive still calling an inference provider they had moved off.
+func (s *Server) hiveGatewayBackend() string {
+	shared := ""
+	for name, agent := range s.deps.Config.Agents {
+		if !agent.Enabled || s.deps.Config.IsAgentRemoved(name) {
+			continue
+		}
+		backend := strings.TrimSpace(agent.Backend)
+		if !s.agentOnForeignGatewayBackend(backend, "") {
+			continue
+		}
+		if shared != "" && !strings.EqualFold(shared, backend) {
+			return ""
+		}
+		shared = backend
+	}
+	if shared == "" || !s.deps.Config.BackendAllowed(shared) {
+		return ""
+	}
+	return shared
+}
+
+// gatewayPlacement is the backend a pack-owned agent is moved to so it follows
+// the hive's gateway (hiveGatewayBackend), or "" to keep packBackend. Only a
+// pack CLI placement is redirected: a pack that itself names a gateway, or a
+// placement the spoke's backends list already replaced, is left alone.
+func gatewayPlacement(packBackend string, backendReplaced bool, hiveGateway string) string {
+	if hiveGateway == "" || backendReplaced || !config.IsCLIBackend(packBackend) {
+		return ""
+	}
+	return hiveGateway
 }
