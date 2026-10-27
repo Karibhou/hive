@@ -252,6 +252,7 @@ func (s *Scheduler) enforceTextFrom(text string, src ioscan.Source) (string, ios
 	if err != nil {
 		if s.classifierFailClosed() {
 			s.recordClassifierSkip("error_fail_closed")
+			s.classifierUnavailable(err)
 			if s.logger != nil {
 				if strings.Contains(err.Error(), "no model endpoint resolved") {
 					s.warnOnce("classifier-no-endpoint", "ioscan classifier failed closed; text withheld",
@@ -411,4 +412,20 @@ func (s *Scheduler) IoscanHooksForTest() (audit AuditFunc, advisory AdvisoryFunc
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.auditFunc, s.advisoryFunc, s.classifier != nil
+}
+
+// SetClassifierUnavailableFunc attaches an alert callback for runtime fail-closed errors.
+func (s *Scheduler) SetClassifierUnavailableFunc(f func(error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.classifierUnavailableFunc = f
+}
+
+func (s *Scheduler) classifierUnavailable(err error) {
+	s.mu.RLock()
+	f := s.classifierUnavailableFunc
+	s.mu.RUnlock()
+	if f != nil {
+		f(err)
+	}
 }

@@ -444,3 +444,30 @@ func TestCLIClassifier_DailyQuotaExhaustion(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifierUnavailableCallback_OnlyForFailClosedErrors(t *testing.T) {
+	for _, mode := range []string{"open", "closed"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newSchedulerWithIoscanFailMode(true, mode)
+			s.SetClassifier(&fakeInjectionClassifier{err: errors.New("runtime failure")}, ioscan.Thresholds{})
+			var got error
+			s.SetClassifierUnavailableFunc(func(err error) { got = err })
+			s.enforceIssueTextVerdict("ordinary issue text")
+			if (got != nil) != (mode == "closed") {
+				t.Fatalf("callback error = %v for mode %s", got, mode)
+			}
+		})
+	}
+}
+
+func TestClassifierUnavailableCallback_NotForQuota(t *testing.T) {
+	s := newSchedulerWithIoscanFailMode(true, "closed")
+	s.SetClassifier(&fakeInjectionClassifier{err: &ioscan.DailyQuotaExhaustedError{Day: "2026-10-27", Quota: 1}}, ioscan.Thresholds{})
+	called := false
+	s.SetClassifierUnavailableFunc(func(error) { called = true })
+	const text = "ordinary issue text"
+	got, _ := s.enforceIssueTextVerdict(text)
+	if called || got != text {
+		t.Fatalf("quota exhaustion: callback = %v, text = %q", called, got)
+	}
+}
