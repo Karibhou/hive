@@ -92,6 +92,10 @@ type Commit struct {
 	Author string `json:"author,omitempty"`
 	// Title is the first line of the commit message.
 	Title string `json:"title,omitempty"`
+	// Parents are the commit's parent SHAs, first parent first. Never
+	// persisted in an Entry; carried only so the mergeability upkeep can
+	// prove a new head is its own merge-from-base (IsHygieneMerge).
+	Parents []string `json:"parents,omitempty"`
 }
 
 // Entry is the persisted per-PR snapshot taken while the PR sits hold-gated.
@@ -276,6 +280,19 @@ func (s *Store) ReArm(repo string, number int, headSHA string, commits []Commit)
 	e.Commented = false
 	e.UpdatedAt = now
 	s.saveLocked()
+}
+
+// IsHygieneMerge reports whether head is provably the merge-from-base the hive
+// asked for: a two-parent commit whose first parent is requestedHead (the head
+// the hive updated) and whose second parent is baseSHA (the base it merged
+// in). Anything else — a contributor push landing between the update request
+// and the refetch, a merge of some other branch, an unknown head or base —
+// is not proven hygiene and must not become the baseline (hivecommons/hive#14534).
+func IsHygieneMerge(head Commit, requestedHead, baseSHA string) bool {
+	if head.SHA == "" || requestedHead == "" || baseSHA == "" || len(head.Parents) != 2 {
+		return false
+	}
+	return head.Parents[0] == requestedHead && head.Parents[1] == baseSHA
 }
 
 // AdvanceHygiene moves a held PR's baseline forward to a head the hive itself

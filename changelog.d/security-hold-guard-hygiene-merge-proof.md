@@ -1,0 +1,1 @@
+- The hold guard only advances a held PR's reviewed baseline after a merge-from-base when the new head is provably that merge (parents are the updated head and the base), so a contributor push racing the update can no longer be adopted as reviewed hygiene ([#14534](https://github.com/hivecommons/hive/issues/14534)).

@@ -95,7 +95,7 @@ func enforceHoldGuard(
 		}
 		commits := make([]holdguard.Commit, 0, len(got))
 		for _, c := range got {
-			commits = append(commits, holdguard.Commit{SHA: c.SHA, Author: c.Author, Title: c.Title})
+			commits = append(commits, holdguard.Commit{SHA: c.SHA, Author: c.Author, Title: c.Title, Parents: c.Parents})
 		}
 		return commits
 	}
@@ -246,8 +246,11 @@ func enforceHoldGuard(
 // identity. On success the result is hygiene, not reviewable content, so the
 // guard's baseline is advanced to the new head (holdguard.AdvanceHygiene) —
 // this is what keeps the next lift check from reading the hive's own upkeep
-// push as drift. On failure (a real conflict the hive cannot resolve), a
-// one-time comment tells the human before they open the review, deduplicated
+// push as drift. The advance requires proof that the new head IS that merge
+// (holdguard.IsHygieneMerge: parents are the requested head and the base); a
+// head that moved any other way stays unadopted and reads as drift. On
+// failure (a real conflict the hive cannot resolve), a one-time comment tells
+// the human before they open the review, deduplicated
 // through the ledger's ConflictNoted bit exactly like the drift comment
 // dedupes through Commented.
 //
@@ -309,6 +312,16 @@ func maintainHeldPRMergeability(
 			// alone rather than advance it on stale information.
 			logger.Warn("hold guard: could not confirm new head after keeping held PR mergeable",
 				"repo", repo, "pr", pr.Number)
+			continue
+		}
+		if !holdguard.IsHygieneMerge(commits[len(commits)-1], pr.HeadSHA, pr.BaseSHA) {
+			// The head moved, but not provably to the hive's own merge of the
+			// base into the head it asked to update: a contributor push may
+			// have landed between the 202 and the refetch. Advancing would
+			// adopt unreviewed commits as the baseline, so leave it pinned and
+			// let the lift check read the move as drift (hivecommons/hive#14534).
+			logger.Warn("hold guard: new head after keeping held PR mergeable is not a merge of the base into the held head; baseline left pinned",
+				"repo", repo, "pr", pr.Number, "requested_head", pr.HeadSHA, "base", pr.BaseSHA, "new_head", newHead)
 			continue
 		}
 		store.AdvanceHygiene(repo, pr.Number, newHead, commits)
