@@ -240,3 +240,72 @@ func TestApplyPackDoesNotMigrateFleetForOneGatewayAgent(t *testing.T) {
 		}
 	}
 }
+
+// packCLIAgent is an agent the pack created on its own copilot CLI, as the L2
+// pack does for supervisor/brainstorm (and did for reviewer before #14678).
+func packCLIAgent(name string) config.AgentConfig {
+	return config.AgentConfig{
+		ID: name, Role: name, Enabled: true,
+		Backend: "copilot", BackendOwner: config.FieldOwnerPack,
+		Model: "claude-sonnet-4-6", ModelOwner: config.FieldOwnerPack,
+	}
+}
+
+// TestApplyPackGatewayWithPreexistingPackCLIAgents is the real L2 roster
+// behind #14678: supervisor and brainstorm already exist pack-owned on
+// copilot when reviewer arrives, and the operator moved only
+// scanner/quality/guide. Pack-owned CLI placements do not veto the move, so
+// reviewer is created on the gateway and the two older ones follow it — in
+// one apply, even though each sees the other still on copilot.
+func TestApplyPackGatewayWithPreexistingPackCLIAgents(t *testing.T) {
+	tests := []struct {
+		name        string
+		preexisting []string
+	}{
+		{"reviewer created", []string{"supervisor", "brainstorm"}},
+		{"reviewer repaired alongside two others", []string{"supervisor", "brainstorm", "reviewer"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := gatewayHive(t, "litellm")
+			for _, name := range tt.preexisting {
+				srv.deps.Config.Agents[name] = packCLIAgent(name)
+			}
+			for i := 0; i < 2; i++ {
+				if _, err := srv.ApplyPack(2); err != nil {
+					t.Fatalf("ApplyPack(2) #%d: %v", i, err)
+				}
+				for _, name := range []string{"supervisor", "brainstorm", "reviewer"} {
+					got, ok := srv.deps.Config.Agents[name]
+					if !ok {
+						t.Fatalf("apply #%d: L2 pack did not create %s", i, name)
+					}
+					if got.Backend != "litellm" || got.Model != "" {
+						t.Errorf("apply #%d: %s backend=%q model=%q, want litellm with no model", i, name, got.Backend, got.Model)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestApplyPackKeepsPackBackendWhenOperatorPicksAreMinority: three operator
+// gateway agents that are at most half of the other enabled agents is not
+// "the hive moved", so the pack's CLI placements stay. Four pack CLI agents
+// so that every pack agent, which does not count itself, still sees three
+// operator picks among six others.
+func TestApplyPackKeepsPackBackendWhenOperatorPicksAreMinority(t *testing.T) {
+	srv := gatewayHive(t, "litellm")
+	packCLI := []string{"supervisor", "brainstorm", "ci-maintainer", "triage"}
+	for _, name := range packCLI {
+		srv.deps.Config.Agents[name] = packCLIAgent(name)
+	}
+	if _, err := srv.ApplyPack(2); err != nil {
+		t.Fatalf("ApplyPack(2): %v", err)
+	}
+	for _, name := range append(packCLI, "reviewer") {
+		if got := srv.deps.Config.Agents[name].Backend; got != "copilot" {
+			t.Errorf("%s backend = %q, want the pack's copilot: operator picks are not a majority", name, got)
+		}
+	}
+}

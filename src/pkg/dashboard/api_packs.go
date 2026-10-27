@@ -159,6 +159,7 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 			tombstoned = append(tombstoned, pa.Name)
 			continue
 		}
+		hiveGateway := s.hiveGatewayBackend(hiveBackends, pa.Name)
 		if existing, exists := s.deps.Config.Agents[pa.Name]; exists {
 			changed := false
 
@@ -211,8 +212,8 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 			// A pack agent still sitting on the CLI the pack gave it follows
 			// the hive's gateway (#14678). Only a backend the pack itself
 			// wrote moves — never an operator's pick, nor a legacy unowned one.
-			if gw := gatewayPlacement(packBackend, backendReplaced, s.hiveGatewayBackend(hiveBackends, pa.Name)); gw != "" &&
-				existing.BackendOwner == config.FieldOwnerPack && strings.EqualFold(existing.Backend, packBackend) {
+			gw := gatewayPlacement(packBackend, backendReplaced, hiveGateway)
+			if gw != "" && existing.BackendIsPackOwned() && strings.EqualFold(existing.Backend, packBackend) {
 				s.logger.Info("moving pack-owned agent onto the hive's inference gateway",
 					"agent", pa.Name, "backend", existing.Backend, "gateway", gw)
 				existing.Backend = gw
@@ -388,7 +389,7 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 		}
 		// The pack model is an id from the pack CLI's catalogue; on the
 		// gateway it is cleared so the gateway's default_model applies (#9945).
-		if gw := gatewayPlacement(packBackend, backendReplaced, s.hiveGatewayBackend(hiveBackends, pa.Name)); gw != "" {
+		if gw := gatewayPlacement(packBackend, backendReplaced, hiveGateway); gw != "" {
 			packBackend = gw
 			packModel = ""
 		}
@@ -1129,10 +1130,6 @@ func (s *Server) ensureCPUTier(level int) {
 	}
 }
 
-// packAgentBackend is the backend a pack agent is placed on: the pack's own
-// choice, unless the spoke's backends allow/deny list (#11310) disallows it,
-// in which case the list's fallback ("" = hive default) is used instead and
-// replaced reports true.
 // agentOnForeignGatewayBackend reports whether an agent runs on an
 // inference-routed backend (litellm/vllm/llm-d or a configured gateway name)
 // other than the pack's backend, so a pack model — an id from the pack
@@ -1144,6 +1141,10 @@ func (s *Server) agentOnForeignGatewayBackend(agentBackend, packBackend string) 
 	return config.IsInferenceBackend(agentBackend) || s.deps.Config.Governor.ResolveGateway(agentBackend) != nil
 }
 
+// packAgentBackend is the backend a pack agent is placed on: the pack's own
+// choice, unless the spoke's backends allow/deny list (#11310) disallows it,
+// in which case the list's fallback ("" = hive default) is used instead and
+// replaced reports true.
 func (s *Server) packAgentBackend(pa config.PackAgent) (backend string, replaced bool) {
 	if s.deps.Config.BackendAllowed(pa.Backend) {
 		return pa.Backend, false
@@ -1151,47 +1152,66 @@ func (s *Server) packAgentBackend(pa config.PackAgent) (backend string, replaced
 	return s.deps.Config.Backends.Fallback(), true
 }
 
+// agentBackendVote is one enabled agent's backend as seen by
+// hiveGatewayBackend: the backend and whether an operator picked it.
+type agentBackendVote struct {
+	backend       string
+	operatorOwned bool
+}
+
 // hiveAgentBackends snapshots the backend of every enabled agent, keyed by
 // name, for hiveGatewayBackend.
-func (s *Server) hiveAgentBackends() map[string]string {
-	backends := map[string]string{}
+func (s *Server) hiveAgentBackends() map[string]agentBackendVote {
+	backends := map[string]agentBackendVote{}
 	for name, agent := range s.deps.Config.Agents {
 		if !agent.Enabled || s.deps.Config.IsAgentRemoved(name) {
 			continue
 		}
-		backends[name] = strings.TrimSpace(agent.Backend)
+		backends[name] = agentBackendVote{
+			backend:       strings.TrimSpace(agent.Backend),
+			operatorOwned: agent.BackendIsOperatorOwned(),
+		}
 	}
 	return backends
 }
 
-// hiveGatewayBackend is the inference gateway the whole hive already runs on:
-// the one backend shared by every enabled agent other than except, each of
-// which must route through an inference backend or configured gateway. It is
-// "" when any of them sits on a subscription CLI or the hive default, when
-// they disagree, or when there are none. except is the pack agent being
-// placed, so its own pack CLI placement is not counted against the move.
+// hiveGatewayBackend is the inference gateway the operator moved the hive
+// onto: the one inference backend or configured gateway that every
+// operator-picked backend among the enabled agents other than except names,
+// when those operator picks are a majority of all those other agents. It is
+// "" when any operator-picked backend is a subscription CLI, the hive
+// default or a different gateway, when the operator's picks are not a
+// majority, or when there are none. except is the pack agent being placed,
+// so its own pack CLI placement is not counted against the move.
 //
 // A pack agent a level adds later is placed on this backend instead of its
 // pack CLI (#14678): an operator who moved scanner/quality/guide onto a LiteLLM
 // gateway found the L2 `reviewer`, added afterwards, on copilot — the only
 // agent in the hive still calling an inference provider they had moved off.
-// Requiring every other agent to agree keeps one agent moved onto a gateway
-// from migrating the pack's CLI agents with it.
-func (s *Server) hiveGatewayBackend(backends map[string]string, except string) string {
-	shared := ""
-	for name, backend := range backends {
+// Only operator-owned backends vote so the pack's own CLI placements (the L2
+// `supervisor`/`brainstorm`, or a reviewer the pack created before this fix)
+// cannot veto the move they are the subject of, and the majority bar keeps
+// one agent moved onto a gateway from migrating the pack's CLI agents with it.
+func (s *Server) hiveGatewayBackend(backends map[string]agentBackendVote, except string) string {
+	shared, others, votes := "", 0, 0
+	for name, vote := range backends {
 		if strings.EqualFold(name, except) {
 			continue
 		}
-		if !s.agentOnForeignGatewayBackend(backend, "") {
+		others++
+		if !vote.operatorOwned {
+			continue
+		}
+		if !s.agentOnForeignGatewayBackend(vote.backend, "") {
 			return ""
 		}
-		if shared != "" && !strings.EqualFold(shared, backend) {
+		if shared != "" && !strings.EqualFold(shared, vote.backend) {
 			return ""
 		}
-		shared = backend
+		shared = vote.backend
+		votes++
 	}
-	if shared == "" || !s.deps.Config.BackendAllowed(shared) {
+	if shared == "" || votes*2 <= others || !s.deps.Config.BackendAllowed(shared) {
 		return ""
 	}
 	return shared
