@@ -332,6 +332,56 @@ Source: `ReviewCapable` in `src/pkg/review/dispatch.go`, which the dashboard
 (`dashboardAgentReviewCapable` in `src/pkg/dashboard/status_builder.go`), the relay and
 the merge-eligibility gate all call.
 
+## Reviewer autoscaling (`review.reviewers.autoscale`)
+
+A reviewer lane with a fixed `replicas` count becomes the bottleneck when the PR backlog
+grows, even with CPU and memory to spare. `review.reviewers.autoscale` lets the planner
+vary how many of one reviewer agent's replicas take review kicks, between `min` and `max`
+([#14685](https://github.com/hivecommons/hive/issues/14685)).
+
+```yaml
+review:
+  reviewers:
+    autoscale:
+      enabled: true
+      agent: reviewer                  # base agent to scale (default "reviewer")
+      min: 2                           # default 1
+      max: 5                           # default and ceiling: 5 (MaxAgentReplicas)
+      target_backlog_per_reviewer: 2   # scale up above this many waiting PRs per active reviewer
+      scale_up_cycles: 2               # consecutive cycles of pressure before a step up
+      scale_down_cycles: 5             # consecutive idle cycles before a step down
+      cooldown: 5m                     # minimum time between two steps
+      max_wait: 30m                    # a PR waiting this long is pressure on its own
+      cpu_per_reviewer: 0.5            # headroom one more reviewer needs (cores)
+      mem_per_reviewer_mb: 1024        # headroom one more reviewer needs (MB)
+```
+
+- **Replicas.** Enabling it materializes the agent's replicas up to `max`
+  (`reviewer-2` … `reviewer-N`) through the same machinery as `agents.<name>.replicas`, so
+  token minting, tmux wiring, cadence keys and the dashboard treat them as ordinary
+  replicas. The declared `replicas` is never rewritten. Replicas numbered above the active
+  count take no review-swarm kick and no cadence kick (the eval log lists them under
+  `agents_skipped` as `autoscale-inactive`). Review heads are not scaled.
+- **Backlog.** Each cycle the planner records the PR heads that needed a plain reviewer
+  and found every active one busy (`DispatchPlan.ReviewerStarved`); the autoscaler tracks
+  how long each has waited.
+- **Scale up** when the backlog exceeds `target_backlog_per_reviewer` per active reviewer,
+  or the oldest waiting PR is older than `max_wait`, for `scale_up_cycles` consecutive
+  cycles. A step is held at `max`, inside `cooldown`, while the provider budget latch is
+  set, when the pod's cgroup headroom is below one reviewer's `cpu_per_reviewer` /
+  `mem_per_reviewer_mb`, and for one `cooldown` after a reviewer kick failed with
+  `did not reach input prompt` (saturation, not demand).
+- **Scale down** when fewer PRs wait than there are active reviewers for
+  `scale_down_cycles` consecutive cycles. The highest-numbered replica stops receiving new
+  work; a turn it already started is never interrupted and its verdict is recorded as
+  usual, so it drains rather than dies.
+- **Observability.** Every step logs one line, e.g.
+  `reviewer autoscale: 2→3 reason=backlog=7 oldest=41m0s`, with the agent, min and max.
+  The active count is held in memory: after a restart the lane starts again at `min`.
+
+Source: `ReviewerAutoscaler.Decide` in `src/pkg/review/autoscale.go`; wiring in
+`src/cmd/hive/review_autoscale.go`.
+
 ## Review heads: several models per perspective
 
 `agents.<name>.review_heads` gives one base reviewer several model "heads" ([#13542](https://github.com/hivecommons/hive/issues/13542)). Each head is materialized like `replicas`: `<base>-<alias>-<n>` copies the base agent with only `backend` and `model` replaced, is stripped on save, and is provisioned at boot by the entrypoint. `alias` defaults to a slug of `<backend>-<model>` (without repeating the backend when the model already starts with it). The agent's Unix user and token group are `hive-<name>`, and group names are limited to 32 characters, so `<base>-<alias>-<n>` may be at most 27 characters; a longer name fails config load, so set a shorter `alias`.

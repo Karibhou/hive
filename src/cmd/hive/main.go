@@ -7346,6 +7346,9 @@ func runEvalCycle(
 		}
 		return ""
 	})
+	// Replicas the reviewer autoscaler has scaled in take no cadence kick
+	// either, or an idle reviewer-5 would still run a turn every interval.
+	agentsDue, agentsSkipped = withholdInactiveReviewerReplicas(agentsDue, agentsSkipped, cfg, &reviewerAutoscale)
 
 	// PROVIDER SPEND REBUFF (#4294). When the inference gateway is refusing on a
 	// money limit, every kick launched this cycle is a run that cannot buy a
@@ -7653,6 +7656,7 @@ func runEvalCycle(
 				gov.RecordKickFailure(msg.Agent, err, time.Now())
 				if k, ok := reviewKickByMessage[reviewKickKey(msg)]; ok {
 					logUndeliveredReviewKick(logger, dashSrv, k, err)
+					noteReviewerAutoscaleKickFailure(cfg, &reviewerAutoscale, k.Agent, err, time.Now())
 				}
 			},
 			onDelivered: func(msg scheduler.KickMessage) {
@@ -10762,7 +10766,11 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 		DeltaRereview:         cfg.Review.DeltaRereviewEnabled(),
 		DeltaTrivialLines:     cfg.Review.EffectiveDeltaTrivialLines(),
 		DeltaMaxAge:           cfg.Review.EffectiveDeltaMaxAge(),
+		ReplicaLimits:         reviewerReplicaLimits(cfg, &reviewerAutoscale),
 	})
+	if cfg.Review.Reviewers.Autoscale.Enabled {
+		decideReviewerAutoscale(cfg, &reviewerAutoscale, plan, liveReviewerAutoscaleSignals(), logger)
+	}
 	recordReviewDeltaRestamps(plan, logger)
 	for _, k := range plan.ReviewKicks {
 		if k.BotAuthorRouted {

@@ -6501,6 +6501,7 @@ func (c *Config) ExpandAgentReplicas() error {
 		if replicas < 1 || replicas > MaxAgentReplicas {
 			return fmt.Errorf("agent %s: replicas must be between 1 and %d", name, MaxAgentReplicas)
 		}
+		replicas = c.Review.Reviewers.Autoscale.expandedReplicas(name, replicas)
 		for i := 2; i <= replicas; i++ {
 			derived := replicaAgentName(name, i)
 			if existing, ok := baseAgents[derived]; ok && existing.ReplicaOf == "" {
@@ -6522,8 +6523,11 @@ func (c *Config) ExpandAgentReplicas() error {
 		}
 	}
 	for name, agent := range baseAgents {
-		replicas := normalizeReplicaCount(agent.Replicas)
-		agent.Replicas = replicas
+		agent.Replicas = normalizeReplicaCount(agent.Replicas)
+		// The autoscaler's max materializes the dynamic replicas
+		// (reviewer-3…reviewer-N) through this same path, without rewriting
+		// the declared replicas a save would persist.
+		replicas := c.Review.Reviewers.Autoscale.expandedReplicas(name, agent.Replicas)
 		agent.ReplicaOf = ""
 		agent.ReplicaIndex = 1
 		agent.ReplicaCount = replicas
@@ -7502,6 +7506,9 @@ type ReviewConfig struct {
 	// Backlog is where findings below the blocking line are filed
 	// (hivecommons/hive#11088). See ReviewBacklogConfig.
 	Backlog ReviewBacklogConfig `yaml:"backlog,omitempty" json:"backlog,omitempty"`
+	// Reviewers tunes the reviewer lane itself; today only its autoscaler
+	// (hivecommons/hive#14685). See ReviewReviewersConfig.
+	Reviewers ReviewReviewersConfig `yaml:"reviewers,omitempty" json:"reviewers,omitempty"`
 }
 
 // PlanMatchConfig is the switch for the plan_match review perspective

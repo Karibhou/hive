@@ -834,6 +834,12 @@ governor:
 #                       # shadow.review_gate.would_have_held on the evidence bundle (#12104)
 #   fan_out: false
 #   max_parallel_reviews: 5
+#   reviewers:
+#     autoscale:        # scale the reviewer lane with the PR backlog (#14685); see docs/review-swarm.md
+#       enabled: false
+#       agent: reviewer
+#       min: 1
+#       max: 5
 #   reviewer_agents: [] # optional explicit list; otherwise agents with review role/keywords are used
 #   combined_perspectives: true # RECOMMENDED (#12126): one session + one comment covering every
 #                               # perspective; shared review boilerplate is sent once instead of once

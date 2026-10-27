@@ -72,7 +72,10 @@ var LegacyReviewDispatchStatePath = filepath.Join(outputschema.AgentReportDir, R
 type AgentCapability struct {
 	Name string
 	// ReplicaOf is the base agent a derived replica was expanded from.
-	ReplicaOf      string
+	ReplicaOf string
+	// ReplicaIndex is the replica's position under its base (1 for the base
+	// itself, N for base-N); what DispatchOptions.ReplicaLimits compares.
+	ReplicaIndex   int
 	Enabled        bool
 	Paused         bool
 	OnDemand       bool
@@ -108,6 +111,7 @@ func CapabilityFromConfig(name string, ac config.AgentConfig) AgentCapability {
 	return AgentCapability{
 		Name:           name,
 		ReplicaOf:      ac.ReplicaOf,
+		ReplicaIndex:   ac.ReplicaIndex,
 		Enabled:        ac.Enabled,
 		Paused:         ac.Paused,
 		OnDemand:       ac.OnDemand,
@@ -246,8 +250,14 @@ type DispatchOptions struct {
 	DeltaRereview     bool
 	DeltaTrivialLines int
 	DeltaMaxAge       time.Duration
-	Agents            []AgentCapability
-	Now               time.Time
+	// ReplicaLimits caps, per base agent, which of its plain replicas take
+	// new review kicks: replica N is offered work only while N <= the limit
+	// (review.reviewers.autoscale, hivecommons/hive#14685). A base absent
+	// from the map is unlimited. Review heads are not affected. A replica
+	// over the limit keeps any kick already in flight; it only drains.
+	ReplicaLimits map[string]int
+	Agents        []AgentCapability
+	Now           time.Time
 }
 
 type DispatchState struct {
@@ -500,7 +510,11 @@ type DispatchPlan struct {
 	// ForcedFixes are the changes_requested heads whose fix kick was forced
 	// this cycle after RevisitStarvationCycles revisit-suppressed cycles.
 	ForcedFixes []ForcedFix
-	State       DispatchState
+	// ReviewerStarved keys (ReviewerStarvedKey) the PR heads that needed a
+	// plain reviewer this cycle and found every one busy: the reviewer
+	// autoscaler's backlog (hivecommons/hive#14685).
+	ReviewerStarved []string
+	State           DispatchState
 }
 
 type FixDispatchExclusion struct {
@@ -777,6 +791,7 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 		if opts.CombinedPerspectives {
 			reviewer, free := freeReviewer(prReviewers, plan.inFlight(opts, now))
 			if !free {
+				plan.noteReviewerStarved(pr)
 				continue
 			}
 			agent := reviewer.Name
@@ -851,6 +866,9 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 		for i := 0; i < limit; i++ {
 			reviewer, free := freeReviewer(prReviewers, plan.inFlight(opts, now))
 			if !free {
+				if i == 0 {
+					plan.noteReviewerStarved(pr)
+				}
 				break
 			}
 			agent := reviewer.Name
@@ -884,6 +902,12 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 		}
 	}
 	return plan
+}
+
+// noteReviewerStarved records a PR head that waited this cycle because every
+// plain reviewer was busy.
+func (p *DispatchPlan) noteReviewerStarved(pr PullRequest) {
+	p.ReviewerStarved = append(p.ReviewerStarved, ReviewerStarvedKey(pr.Repo, pr.Number, pr.HeadSHA))
 }
 
 // deltaPreviousHead is the head a delta kick is judged against, "" for a
@@ -1686,12 +1710,33 @@ func reviewCapableAgents(opts DispatchOptions) []AgentCapability {
 		if a.Name == "" || !a.Enabled || a.Paused || a.OnDemand || !a.UsesKick {
 			continue
 		}
+		if overReplicaLimit(a, opts.ReplicaLimits) {
+			continue
+		}
 		if ReviewCapable(a, allowed) {
 			out = append(out, a)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// overReplicaLimit reports a plain replica numbered above its base's
+// DispatchOptions.ReplicaLimits entry. Review heads carry ReplicaOf too, but
+// are their own lanes and never limited.
+func overReplicaLimit(a AgentCapability, limits map[string]int) bool {
+	if len(limits) == 0 || a.ReviewHead != "" {
+		return false
+	}
+	limit, ok := limits[baseOf(a)]
+	if !ok {
+		return false
+	}
+	index := a.ReplicaIndex
+	if index <= 0 {
+		index = 1
+	}
+	return index > limit
 }
 
 // ReviewCapable reports whether one agent is a reviewer under the same rule

@@ -3253,6 +3253,21 @@ func collectSystemResources() *SystemResources {
 	return res
 }
 
+// PodHeadroom is the pod's free CPU (cores) and memory (MB) from the same
+// cgroup sample the status payload reports; -1 for a value that could not be
+// read. The reviewer autoscaler's headroom guard (hivecommons/hive#14685).
+func PodHeadroom() (cpuFreeCores, memFreeMB float64) {
+	res := collectSystemResources()
+	cpuFreeCores, memFreeMB = -1, -1
+	if res.CpuCores > 0 && res.CpuPct > 0 {
+		cpuFreeCores = float64(res.CpuCores) * (1 - res.CpuPct/pctMultiplierSysRes)
+	}
+	if res.MemTotalMB > 0 {
+		memFreeMB = res.MemTotalMB - res.MemUsedMB
+	}
+	return cpuFreeCores, memFreeMB
+}
+
 // readCgroupInt64 reads a single int64 from a cgroup file. Returns -1 on error
 // or if the value is "max" (unlimited).
 func readCgroupInt64(path string) int64 {

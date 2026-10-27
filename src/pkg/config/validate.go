@@ -158,6 +158,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 	if err := c.validateReviewHeads(); err != nil {
 		return err
 	}
+	if err := c.Review.Reviewers.Autoscale.Validate(); err != nil {
+		return err
+	}
 	if err := c.validateGitHubActivityNotifications(); err != nil {
 		return err
 	}
