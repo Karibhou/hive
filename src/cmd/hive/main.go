@@ -71,6 +71,7 @@ import (
 	"github.com/hivecommons/hive/pkg/promptsrc"
 	"github.com/hivecommons/hive/pkg/retro"
 	"github.com/hivecommons/hive/pkg/review"
+	"github.com/hivecommons/hive/pkg/review/autoscale"
 	"github.com/hivecommons/hive/pkg/rfccoverage"
 	"github.com/hivecommons/hive/pkg/rotation"
 	"github.com/hivecommons/hive/pkg/scheduler"
@@ -1452,34 +1453,35 @@ func (b *boot) wireBootClosures() {
 			// linearagent adapters behind the dashboard's consumer-defined
 			// interfaces — this composition root is the only non-test place that
 			// names the concrete types.
-			Watsonx:              watsonxGateway{},
-			OpenRouter:           openRouterGateway{},
-			NewLinearAgent:       newLinearAgentGateway(b.logger),
-			LinearStoredViewerID: linearStoredViewerID,
-			DelegateDecider:      newDelegateDeciderRunner(func() *config.Config { return b.cfg }),
-			ChatGrounder:         newChatGroundingRunner(func() *config.Config { return b.cfg }),
-			Governor:             b.gov,
-			GHClient:             b.ghClient,
-			StageEngineStatus:    func() stageengine.Status { return stageEngineStatus(b.cfg, b.ghClient, b.logger) },
-			ReviewEvents:         b.reviewEvents,
-			WebhookWake:          b.webhookWakeFunc(),
-			ApplyWebhookItems:    b.applyWebhookItemsFunc(),
-			WebhookDelivery:      b.webhookDeliveryFunc(),
-			EvalLoop:             b.evalLoopStatusFunc(),
-			SentinelPREvent:      b.sentinelPREventFunc(),
-			ProjectsV2ItemEvent:  b.projectsV2ItemEventFunc(),
-			GHAppAuth:            b.appAuth,
-			GHTokenScopes:        b.ghAuth.TokenScopes,
-			Tokens:               b.tokenCollector,
-			Knowledge:            b.knowledgeAPI,
-			Inception:            b.inceptionEngine,
-			Nous:                 b.nousState,
-			Scheduler:            b.sched,
-			KnowledgePrimer:      knowledgePrimerControl{b: b},
-			MetricsCollector:     b.metricsCollector,
-			RotationMgr:          b.rotationMgr,
-			QuestionAutoclose:    questionAutocloseView{b: b},
-			HeadroomPublisher:    b.quotaReadingPublisher,
+			Watsonx:                 watsonxGateway{},
+			OpenRouter:              openRouterGateway{},
+			NewLinearAgent:          newLinearAgentGateway(b.logger),
+			LinearStoredViewerID:    linearStoredViewerID,
+			DelegateDecider:         newDelegateDeciderRunner(func() *config.Config { return b.cfg }),
+			ChatGrounder:            newChatGroundingRunner(func() *config.Config { return b.cfg }),
+			Governor:                b.gov,
+			GHClient:                b.ghClient,
+			StageEngineStatus:       func() stageengine.Status { return stageEngineStatus(b.cfg, b.ghClient, b.logger) },
+			ReviewerAutoscaleStatus: func() autoscale.Status { return reviewerAutoscaler.Status() },
+			ReviewEvents:            b.reviewEvents,
+			WebhookWake:             b.webhookWakeFunc(),
+			ApplyWebhookItems:       b.applyWebhookItemsFunc(),
+			WebhookDelivery:         b.webhookDeliveryFunc(),
+			EvalLoop:                b.evalLoopStatusFunc(),
+			SentinelPREvent:         b.sentinelPREventFunc(),
+			ProjectsV2ItemEvent:     b.projectsV2ItemEventFunc(),
+			GHAppAuth:               b.appAuth,
+			GHTokenScopes:           b.ghAuth.TokenScopes,
+			Tokens:                  b.tokenCollector,
+			Knowledge:               b.knowledgeAPI,
+			Inception:               b.inceptionEngine,
+			Nous:                    b.nousState,
+			Scheduler:               b.sched,
+			KnowledgePrimer:         knowledgePrimerControl{b: b},
+			MetricsCollector:        b.metricsCollector,
+			RotationMgr:             b.rotationMgr,
+			QuestionAutoclose:       questionAutocloseView{b: b},
+			HeadroomPublisher:       b.quotaReadingPublisher,
 			// #3972: hand the ACMM advisor the SAME cached fleet-stats collector
 			// the heartbeat reads, so its merge-success signal reuses the existing
 			// 30-minute collect loop instead of issuing a second GitHub fetch.
@@ -3503,6 +3505,7 @@ func (b *boot) bootKnowledgeWith(deps bootKnowledgeDeps) {
 func (b *boot) bootSupervision() {
 	if b.cfg.Governor.Rotation.Enabled {
 		b.rotationMgr = rotation.NewManager(b.cfg.Governor.Rotation)
+		reviewerAutoscaler.SetHeadroomReporter(b.rotationMgr)
 		// Publish normalized readings to where the contributor quota guard reads
 		// them (kubestellar/hive#6967), off the rotation manager's own probe
 		// loop and the operator's configured provider→backends map.
@@ -3953,6 +3956,10 @@ func (b *boot) bootWatchersWith(deps bootWatchersDeps) {
 
 		// Preserve runtime-only fields that are not in the YAML
 		newCfg.HiveID = b.cfg.HiveID
+		// The reviewer autoscaler's current lane size survives a reload so
+		// an edit elsewhere in hive.yaml does not snap reviewers back to the
+		// declared count (hivecommons/hive#14685).
+		newCfg.ReviewerAutoscaleActive = b.cfg.ReviewerAutoscaleActive
 
 		// Preserve ACMM level from the agent manager — it is the
 		// authoritative source. The file may have a stale value if
@@ -4648,6 +4655,9 @@ func (b *boot) bootHeartbeat() { b.bootHeartbeatWith(defaultBootHeartbeatDeps())
 // bootHeartbeatWith is bootHeartbeat with its long-lived effects injected;
 // see bootHeartbeatDeps.
 func (b *boot) bootHeartbeatWith(deps bootHeartbeatDeps) {
+	// The hub re-pushes its project config every beat, so a refused
+	// misconfiguration is logged at ERROR once and at DEBUG while unchanged.
+	var refusedProjectConfig atomic.Value // string key of the last refused push
 	// Hive-self scheduler (#12397): default off; restores durable reverts
 	// before the first heartbeat can apply a self-experiment flag.
 	startNousSelfScheduler(b.ctx, b.cfg, b.logger)
@@ -5680,7 +5690,12 @@ func (b *boot) bootHeartbeatWith(deps bootHeartbeatDeps) {
 					return
 				}
 				if issue := config.ValidateProjectRepoTargets(pc.Org, pc.Repos, pc.PrimaryRepo, b.cfg.GitHub.HostLabel()); issue != nil {
-					b.logger.Error("REFUSING hub project config: repo target is misconfigured — project left unchanged",
+					key := fmt.Sprintf("%q|%q|%q|%s", pc.Org, pc.Repos, pc.PrimaryRepo, issue.Message)
+					logRefusal := b.logger.Error
+					if prev, _ := refusedProjectConfig.Swap(key).(string); prev == key {
+						logRefusal = b.logger.Debug
+					}
+					logRefusal("REFUSING hub project config: repo target is misconfigured — project left unchanged",
 						"error", issue.Message,
 						"pushed_org", pc.Org,
 						"pushed_repos", pc.Repos,
@@ -5688,6 +5703,7 @@ func (b *boot) bootHeartbeatWith(deps bootHeartbeatDeps) {
 					)
 					return
 				}
+				refusedProjectConfig.Store("")
 				curACMM := 0
 				if b.cfg.ACMMLevel != nil {
 					curACMM = *b.cfg.ACMMLevel
@@ -7354,6 +7370,7 @@ func runEvalCycle(
 		}
 		return ""
 	})
+	agentsDue, agentsSkipped = reviewerAutoscaler.withholdDrainingReviewers(agentsDue, agentsSkipped)
 
 	// PROVIDER SPEND REBUFF (#4294). When the inference gateway is refusing on a
 	// money limit, every kick launched this cycle is a run that cannot buy a
@@ -7452,6 +7469,10 @@ func runEvalCycle(
 	agentsDue = sched.FilterFirstScanDeferredAgents(agentsDue)
 	agentsSkipped = append(agentsSkipped, firstScanDeferredSkips(dueBeforeDeferral, agentsDue)...)
 	reviewPlan := planReviewDispatchWith(ctx, cfg, actionable, agentMgr, beadStores, reviewPlannerGitHubFor(ghClient), logger)
+	// Size the reviewer lane to what the planner just left waiting
+	// (hivecommons/hive#14685). A replica added here takes kicks from the
+	// next cycle on; a retire only lands once the reviewer is idle.
+	reviewerAutoscaler.Run(ctx, cfg, reviewPlan, agentMgr, gov, logger, time.Now())
 	auditWithheldReviewFixes(reviewPlan, dashSrv, logger)
 	if ghClient != nil {
 		postReviewAcknowledgements(ctx, ghClient, reviewPlan, logger)
@@ -10736,6 +10757,7 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 	for name, ac := range cfg.EnabledAgents() {
 		cap := review.CapabilityFromConfig(name, ac)
 		cap.Paused = cap.Paused || (agentMgr != nil && agentMgr.IsPaused(name))
+		cap.Draining = reviewerAutoscaler.Draining(name)
 		agents = append(agents, cap)
 	}
 	reviewBotLogins := []string{}
