@@ -334,3 +334,44 @@ func TestReviewerAccuracyScoresHeadsAgainstTheDecision(t *testing.T) {
 		t.Fatalf("an undecided aggregate was scored: %+v", s.ReviewHeads)
 	}
 }
+
+func TestRemovedPerspectiveDoesNotBlockHeads(t *testing.T) {
+	for _, clean := range []bool{false, true} {
+		reports := []PerspectiveReport{
+			headRep(PerspectiveCorrectness, "cr-sol", VerdictApprove),
+			headRep(PerspectiveCorrectness, "cr-sonnet", VerdictApprove),
+			headRep(PerspectiveSecurity, "cr-sol", VerdictApprove),
+			headRep(PerspectiveSecurity, "cr-sonnet", VerdictApprove),
+			headRep(Perspective("removed"), "cr-sol", VerdictChangesRequested, nilDeref),
+		}
+		if !clean {
+			reports[0] = headRep(PerspectiveCorrectness, "cr-sol", VerdictChangesRequested, nilDeref)
+		}
+		agg := AggregateReports(reports, headAggOpts())
+		if clean && (agg.Verdict != VerdictApprove || !agg.DecisionSkipped) {
+			t.Fatalf("clean aggregate = %+v, want skipped approval", agg)
+		}
+		if !clean && !agg.AwaitingDecision {
+			t.Fatalf("aggregate = %+v, want awaiting decision", agg)
+		}
+		if len(agg.HeadReports) != 5 || strings.Contains(strings.Join(agg.Reasons, " "), "removed/") {
+			t.Fatalf("historical evidence or reasons incorrect: %+v", agg)
+		}
+		for _, p := range decisionPerspectives(agg, headAggOpts().Perspectives) {
+			if p == Perspective("removed") {
+				t.Fatalf("decision includes removed perspective: %+v", agg)
+			}
+		}
+	}
+}
+
+func TestRemovedPerspectiveDoesNotCountAsCoverage(t *testing.T) {
+	agg := AggregateReports([]PerspectiveReport{
+		headRep(PerspectiveCorrectness, "cr-sol", VerdictApprove),
+		headRep(PerspectiveCorrectness, "cr-sonnet", VerdictApprove),
+		headRep(Perspective("removed"), "cr-sol", VerdictApprove),
+	}, headAggOpts())
+	if agg.Verdict != VerdictIncomplete || agg.DecisionSkipped || agg.AwaitingDecision {
+		t.Fatalf("aggregate = %+v, want incomplete configured coverage", agg)
+	}
+}
