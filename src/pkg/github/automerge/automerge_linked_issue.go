@@ -58,8 +58,10 @@ func (c *Engine) linkedIssueBlock(labels []string) (string, string) {
 // linkedIssueGate refuses a merge while an open issue in the PR's own repo
 // that the PR body closes is held or parked; the reason
 // (`linked-issue:hold:#N:<label>` / `linked-issue:needs-decision:#N:<label>`)
-// routes the PR to 085 naming the issue and label. Closed issues, pull
-// requests and other repositories' issues never block, nor does a number
+// routes the PR to 085 naming the issue and label. It then runs
+// closingKeywordPRGate: a closing keyword that names a pull request refuses
+// with `closing-keyword-targets-pr:#N`. Closed issues, pull requests and
+// other repositories' issues never hold the PR, nor does a number
 // GitHub reports missing (404/410). Any other read error fails closed with
 // linkedIssueReasonCheck: no merge this tick. Lanes call it only for a
 // head that would otherwise merge, so it costs one issue GET per linked
@@ -72,11 +74,13 @@ func (c *Engine) linkedIssueGate(ctx context.Context, owner, repo string, pr *gh
 		if err != nil {
 			if isGitHubStatus(err, http.StatusNotFound) || isGitHubStatus(err, http.StatusGone) {
 				c.noteCreditIssue(owner, repo, n, nil)
+				c.noteClosingTargetKind(owner, repo, n, false)
 				continue
 			}
 			return linkedIssueReasonCheck, fmt.Errorf("reading linked issue %s#%d: %w", fullRepo, n, err)
 		}
 		c.noteCreditIssue(owner, repo, n, issue)
+		c.noteClosingTargetKind(owner, repo, n, issue.IsPullRequest())
 		if issue.IsPullRequest() || !strings.EqualFold(issue.GetState(), "open") {
 			continue
 		}
@@ -86,7 +90,10 @@ func (c *Engine) linkedIssueGate(ctx context.Context, owner, repo string, pr *gh
 			return reason, nil
 		}
 	}
-	return "", nil
+	// A closing keyword that names a pull request (in the body, or in a
+	// commit message on the head) would close that PR on merge
+	// (hivecommons/hive#15025); the issues read above are not read again.
+	return c.closingKeywordPRGate(ctx, owner, repo, pr)
 }
 
 // noteCreditIssue hands an issue this gate read (nil for one GitHub reported

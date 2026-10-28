@@ -39,6 +39,23 @@ type linkedIssueFront struct {
 	body   string
 	issues map[string]linkedIssue // "owner/repo#N"
 	reads  map[string]int
+	// commits are the messages served for PR 7's commit list (nil leaves
+	// the request to the fixture); commitsStatus non-zero fails the read.
+	commits       []string
+	commitsStatus int
+	commitReads   int
+}
+
+func (f *linkedIssueFront) setBody(body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.body = body
+}
+
+func (f *linkedIssueFront) currentBody() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.body
 }
 
 func (f *linkedIssueFront) set(key string, issue linkedIssue) {
@@ -65,7 +82,28 @@ func newLinkedIssueFront(t *testing.T, backend string, f *linkedIssueFront) *htt
 	f.reads = map[string]int{}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7" && f.body != "" {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7/commits" {
+			f.mu.Lock()
+			messages, status := f.commits, f.commitsStatus
+			if messages != nil || status != 0 {
+				f.commitReads++
+			}
+			f.mu.Unlock()
+			if status != 0 {
+				w.WriteHeader(status)
+				json.NewEncoder(w).Encode(map[string]string{"message": "commit list error"})
+				return
+			}
+			if messages != nil {
+				out := make([]map[string]any, 0, len(messages))
+				for i, m := range messages {
+					out = append(out, map[string]any{"sha": "c" + strconv.Itoa(i), "commit": map[string]any{"message": m}})
+				}
+				json.NewEncoder(w).Encode(out)
+				return
+			}
+		}
+		if body := f.currentBody(); r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7" && body != "" {
 			resp, err := http.Get(backend + r.URL.Path)
 			if err != nil {
 				t.Errorf("backend PR fetch: %v", err)
@@ -83,7 +121,7 @@ func newLinkedIssueFront(t *testing.T, backend string, f *linkedIssueFront) *htt
 			if err := json.Unmarshal(raw, &pull); err != nil {
 				t.Errorf("decode backend PR: %v", err)
 			}
-			pull["body"] = f.body
+			pull["body"] = body
 			json.NewEncoder(w).Encode(pull)
 			return
 		}
@@ -141,7 +179,10 @@ var linkedIssueCases = []linkedIssueCase{
 	{name: "read error fails closed", issue: linkedIssue{status: http.StatusInternalServerError}, wantReason: linkedIssueReasonCheck, wantErr: true},
 	{name: "closed issue does not block", issue: linkedIssue{state: "closed", labels: []string{"hold"}}},
 	{name: "missing issue does not block", issue: linkedIssue{status: http.StatusNotFound}},
-	{name: "pull request does not block", issue: linkedIssue{state: "open", labels: []string{"hold"}, pr: true}},
+	// "Fixes #42" where #42 is a pull request would close that PR on merge
+	// (hivecommons/hive#15025), whatever its labels; the issue read above
+	// it is not repeated.
+	{name: "pull request target holds the merge", issue: linkedIssue{state: "open", labels: []string{"hold"}, pr: true}, wantReason: "closing-keyword-targets-pr:#42"},
 	{name: "unlabelled issue does not block", issue: linkedIssue{state: "open", labels: []string{"bug"}}},
 }
 
