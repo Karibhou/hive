@@ -44,6 +44,10 @@ type linkedIssueFront struct {
 	commits       []string
 	commitsStatus int
 	commitReads   int
+	// baseRef and defaultBranch, when set, are written into PR 7's base
+	// (base.ref and base.repo.default_branch) alongside body.
+	baseRef       string
+	defaultBranch string
 }
 
 func (f *linkedIssueFront) setBody(body string) {
@@ -122,6 +126,27 @@ func newLinkedIssueFront(t *testing.T, backend string, f *linkedIssueFront) *htt
 				t.Errorf("decode backend PR: %v", err)
 			}
 			pull["body"] = body
+			f.mu.Lock()
+			baseRef, defaultBranch := f.baseRef, f.defaultBranch
+			f.mu.Unlock()
+			if baseRef != "" || defaultBranch != "" {
+				base, _ := pull["base"].(map[string]any)
+				if base == nil {
+					base = map[string]any{}
+				}
+				if baseRef != "" {
+					base["ref"] = baseRef
+				}
+				if defaultBranch != "" {
+					repo, _ := base["repo"].(map[string]any)
+					if repo == nil {
+						repo = map[string]any{}
+					}
+					repo["default_branch"] = defaultBranch
+					base["repo"] = repo
+				}
+				pull["base"] = base
+			}
 			json.NewEncoder(w).Encode(pull)
 			return
 		}

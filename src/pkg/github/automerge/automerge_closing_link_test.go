@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	gh "github.com/google/go-github/v72/github"
 	hgithub "github.com/hivecommons/hive/pkg/github"
 )
 
@@ -236,5 +237,72 @@ func TestClosingKeywordCommitReadFailsClosed(t *testing.T) {
 	_, reason, err := c.trySweepSelfAuthoredPR(context.Background(), "acme/widget", "acme", "widget", 7, true)
 	if err == nil || reason != linkedIssueReasonCheck || merges != 0 {
 		t.Fatalf("reason = %q, err = %v, merges = %d; want %s, an error and no merge", reason, err, merges, linkedIssueReasonCheck)
+	}
+}
+
+// GitHub acts on closing keywords only when the PR's base is the default
+// branch. A PR into another branch (a forward-merge carrying upstream
+// commit messages) closes nothing, so neither gate holds it or reads
+// anything for it; a payload that does not name the default branch is
+// gated as before.
+func TestClosingKeywordsApply(t *testing.T) {
+	for name, tc := range map[string]struct {
+		baseRef, defaultBranch string
+		want                   bool
+	}{
+		"default branch":           {"main", "main", true},
+		"case differs":             {"Main", "main", true},
+		"non-default base":         {"v6", "main", false},
+		"default branch unknown":   {"v6", "", true},
+		"base ref unknown":         {"", "main", true},
+		"neither known (fixtures)": {"", "", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pr := &gh.PullRequest{Base: &gh.PullRequestBranch{}}
+			if tc.baseRef != "" {
+				pr.Base.Ref = gh.Ptr(tc.baseRef)
+			}
+			if tc.defaultBranch != "" {
+				pr.Base.Repo = &gh.Repository{DefaultBranch: gh.Ptr(tc.defaultBranch)}
+			}
+			if got := closingKeywordsApply(pr); got != tc.want {
+				t.Fatalf("closingKeywordsApply(base %q, default %q) = %v, want %v", tc.baseRef, tc.defaultBranch, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClosingLinkGatesSkipNonDefaultBase(t *testing.T) {
+	merges := 0
+	api := newSelfSweepGuardAPI(t, selfSweepFixture{mergeApplied: true, mergeCalls: &merges})
+	defer api.Close()
+	// Both shapes at once: a contradictory body and a commit closing PR #1036.
+	front := newCommitClosingFront(linkedIssue{state: "open", pr: true})
+	front.setBody(closingContradictionBody)
+	front.baseRef, front.defaultBranch = "v6", "main"
+	srv := newLinkedIssueFront(t, api.URL, front)
+	defer srv.Close()
+	c := newAutoMergeSweepClient(srv.URL)
+	c.scanCommitClosingKeywords = true
+
+	if _, reason, err := c.trySweepSelfAuthoredPR(context.Background(), "acme/widget", "acme", "widget", 7, true); err != nil || reason != "" || merges != 1 {
+		t.Fatalf("reason = %q, err = %v, merges = %d; want a merge: closing keywords do nothing off the default branch", reason, err, merges)
+	}
+	if got := front.readsOf("acme/widget#1036"); got != 0 {
+		t.Fatalf("target reads = %d, want 0", got)
+	}
+	front.mu.Lock()
+	commitReads := front.commitReads
+	front.mu.Unlock()
+	if commitReads != 0 {
+		t.Fatalf("commit list reads = %d, want 0", commitReads)
+	}
+
+	// The same PR into the default branch is held as before.
+	front.mu.Lock()
+	front.baseRef = "main"
+	front.mu.Unlock()
+	if _, reason, err := c.trySweepSelfAuthoredPR(context.Background(), "acme/widget", "acme", "widget", 7, true); err != nil || reason != "closing-contradiction:#42" || merges != 1 {
+		t.Fatalf("default-branch tick: reason = %q, err = %v, merges = %d; want closing-contradiction:#42", reason, err, merges)
 	}
 }

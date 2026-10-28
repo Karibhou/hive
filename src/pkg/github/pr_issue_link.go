@@ -380,10 +380,21 @@ func issueStaysOpenPhrase(text string, issue int) bool {
 	if text == "" || issue <= 0 {
 		return false
 	}
-	ref := `#` + strconv.Itoa(issue) + `\b`
-	pattern := regexp.MustCompile(`(?i)\bleav(?:e|es|ing) ` + ref + ` open\b|` + ref + ` (?:stays|remains) open\b|(?:\bnot|n't) close ` + ref)
-	return pattern.MatchString(text)
+	want := strconv.Itoa(issue)
+	for _, m := range issueStaysOpenPattern.FindAllStringSubmatch(text, -1) {
+		for _, n := range m[1:] {
+			if n == want {
+				return true
+			}
+		}
+	}
+	return false
 }
+
+// issueStaysOpenPattern is compiled once: each alternative captures the
+// issue number so issueStaysOpenPhrase compares it instead of compiling a
+// pattern per issue per call.
+var issueStaysOpenPattern = regexp.MustCompile(`(?i)\bleav(?:e|es|ing) #(\d+)\b open\b|#(\d+)\b (?:stays|remains) open\b|(?:\bnot|n't) close #(\d+)\b`)
 
 // gitHubClosingRefPattern matches only the closing-keyword form GitHub itself
 // acts on when a PR merges: a keyword, an optional colon, whitespace, then

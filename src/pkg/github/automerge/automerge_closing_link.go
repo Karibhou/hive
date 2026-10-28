@@ -36,11 +36,26 @@ const (
 	closingLinkCacheMax = 4096
 )
 
+// closingKeywordsApply reports whether GitHub would act on the PR's closing
+// keywords at merge: it closes the named issues only when the PR's base is
+// the repository's default branch. A PR into another branch (a v5→v6
+// forward-merge carrying upstream commit messages, say) closes nothing, so
+// neither gate holds it. When the payload does not name the default branch
+// the base is taken to be it, so a partial read fails toward the gate.
+func closingKeywordsApply(pr *gh.PullRequest) bool {
+	base := pr.GetBase()
+	defaultBranch := base.GetRepo().GetDefaultBranch()
+	return base.GetRef() == "" || defaultBranch == "" || strings.EqualFold(base.GetRef(), defaultBranch)
+}
+
 // closingContradictionGate refuses a PR whose body both closes a repo issue
 // and says that issue stays open or is partial
 // (`closing-contradiction:#N`). It costs no API call: the lanes run it right
 // after their label checks, before admission, CI or soak.
 func (c *Engine) closingContradictionGate(owner, repo string, pr *gh.PullRequest) string {
+	if !closingKeywordsApply(pr) {
+		return ""
+	}
 	fullRepo := owner + "/" + repo
 	issues := hgithub.ClosingContradictions(pr.GetBody(), fullRepo)
 	if len(issues) == 0 {
@@ -58,8 +73,12 @@ func (c *Engine) closingContradictionGate(owner, repo string, pr *gh.PullRequest
 // target of a closing keyword. Whether a number is a pull request never
 // changes, so each number is read at most once per process, and the commit
 // messages once per head. A read error other than 404/410 fails closed with
-// linkedIssueReasonCheck.
+// linkedIssueReasonCheck. A PR whose base is not the default branch closes
+// nothing on merge, so it passes without a read.
 func (c *Engine) closingKeywordPRGate(ctx context.Context, owner, repo string, pr *gh.PullRequest) (string, error) {
+	if !closingKeywordsApply(pr) {
+		return "", nil
+	}
 	fullRepo := owner + "/" + repo
 	targets := hgithub.GitHubClosingRefs(pr.GetBody(), fullRepo)
 	if c.scanCommitClosingKeywords {
