@@ -8708,6 +8708,14 @@
         if (isHosted && (roleAtLeast(h.role, 'read-write'))) menuItems.push('<div onclick="openAccessModal(\'' + esc(h.id) + '\',\'' + esc(h.dashboardUrl || '') + '\')" style="' + mi + '">Permissions</div>');
         /* Timeline is owner-or-admin, matching the API's authorization. */
         if (isHosted && (h.role === 'owner' || _isAdmin)) menuItems.push('<div onclick="openTimelineModal(\'' + esc(h.id) + '\',\'' + esc(h.name || h.id) + '\')" style="' + mi + '">Activity Timeline</div>');
+        /* Pause/Resume hive (#15092): the spoke's own top-bar "running ⏸"
+           fleet breaker, reachable without opening its dashboard. Owner-or-
+           admin like the endpoint. The breaker is engaged when any agent
+           reports pausedTrigger 'fleet-breaker' (crux.BreakerTrigger). */
+        if (isHosted && (h.role === 'owner' || _isAdmin)) {
+          var breakerOn = (h.agents || []).some(function(a) { return a.paused && a.pausedTrigger === 'fleet-breaker'; });
+          menuItems.push('<div onclick="setHiveBreaker(\'' + esc(h.id) + '\',\'' + esc(h.name || h.id) + '\',' + (!breakerOn) + ')" style="' + mi + '">' + (breakerOn ? '▶︎ Resume hive' : '⏸︎ Pause hive') + '</div>');
+        }
         if (roleAtLeast(h.role, 'read-write') || _isAdmin) menuItems.push('<div onclick="openOpenRouterFundModal(\'' + esc(h.id) + '\',\'' + esc(h.name || h.id) + '\')" style="' + mi + '">⚡ Fund with OpenRouter</div>');
         if (_isAdmin && isHosted) menuItems.push('<div onclick="openBannerForHive(\'' + esc(h.id) + '\',\'' + esc(h.name || h.id) + '\')" style="' + mi + '">Send Banner</div>');
         /* Reset App clears ONLY the spoke's installation_id, which makes
@@ -10339,6 +10347,30 @@
         if (typeof loadHives === 'function') loadHives();
       } catch (e) {
         await hiveNotify('Restart failed', String(e));
+      }
+    }
+
+    /* Pause or resume a whole hive through its fleet breaker (#15092). The
+       hub queues the instruction and the spoke applies it on its next
+       heartbeat, exactly as if its own top-bar ⏸ had been clicked. */
+    async function setHiveBreaker(hiveId, hiveName, engage) {
+      var verb = engage ? 'Pause' : 'Resume';
+      var detail = engage
+        ? 'Every running agent pauses on the spoke\'s next heartbeat (up to 2 minutes). Agents already paused and on-demand agents are left alone.'
+        : 'Only the agents the pause stopped resume on the spoke\'s next heartbeat (up to 2 minutes).';
+      if (!await hiveConfirm(verb + ' hive "' + hiveName + '"?\n\n' + detail)) return;
+      try {
+        var resp = await fetch('/api/saas/hives/' + encodeURIComponent(hiveId) + '/breaker', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({engaged: engage})
+        });
+        var data = await resp.json().catch(function() { return {}; });
+        if (!resp.ok) { hiveToast(verb + ' failed: ' + String(data.error || resp.status), 'error'); return; }
+        hiveToast(verb + ' queued for ' + hiveName + ' — applies on its next heartbeat', 'success');
+        if (typeof loadHives === 'function') loadHives();
+      } catch (e) {
+        hiveToast(verb + ' failed: ' + String(e), 'error');
       }
     }
 
