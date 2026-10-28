@@ -45,9 +45,41 @@ type linkedIssueFront struct {
 	commitsStatus int
 	commitReads   int
 	// baseRef and defaultBranch, when set, are written into PR 7's base
-	// (base.ref and base.repo.default_branch) alongside body.
+	// (base.ref and base.repo.default_branch) alongside body. A named base
+	// makes the sweep read the branch (release hold, protection, rules and
+	// compare), which the lane fixtures do not serve; the front answers
+	// those as an unprotected, release-free branch the head is current with.
 	baseRef       string
 	defaultBranch string
+}
+
+// serveBaseBranch answers the base-branch reads a named baseRef triggers
+// (see automerge_contributor_lane_test.go for the same routes). Returns
+// false when r is not one of them.
+func (f *linkedIssueFront) serveBaseBranch(w http.ResponseWriter, r *http.Request) bool {
+	f.mu.Lock()
+	baseRef := f.baseRef
+	f.mu.Unlock()
+	if baseRef == "" || r.Method != http.MethodGet {
+		return false
+	}
+	prefix := "/repos/acme/widget/"
+	switch r.URL.Path {
+	case prefix + "branches/" + baseRef:
+		json.NewEncoder(w).Encode(map[string]any{"name": baseRef, "commit": map[string]string{"sha": "base1"}})
+	case prefix + "branches/" + baseRef + "/protection/required_status_checks":
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{"message": "Branch not protected"})
+	case prefix + "rules/branches/" + baseRef:
+		json.NewEncoder(w).Encode([]any{})
+	case prefix + "commits/base1/status":
+		json.NewEncoder(w).Encode(map[string]any{"state": "success", "total_count": 0, "statuses": []any{}})
+	case prefix + "compare/" + baseRef + "...sha7":
+		json.NewEncoder(w).Encode(map[string]any{"behind_by": 0, "ahead_by": 1})
+	default:
+		return false
+	}
+	return true
 }
 
 func (f *linkedIssueFront) setBody(body string) {
@@ -86,6 +118,9 @@ func newLinkedIssueFront(t *testing.T, backend string, f *linkedIssueFront) *htt
 	f.reads = map[string]int{}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if f.serveBaseBranch(w, r) {
+			return
+		}
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7/commits" {
 			f.mu.Lock()
 			messages, status := f.commits, f.commitsStatus
