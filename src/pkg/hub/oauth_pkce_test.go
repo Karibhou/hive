@@ -172,11 +172,12 @@ func TestPKCE_CallbackSendsVerifierInFormBody(t *testing.T) {
 	cleanup := helperSetupTempDirs(t)
 	defer cleanup()
 
-	var gotMethod, gotCT, gotVerifier, gotRawQuery string
+	var gotMethod, gotCT, gotVerifier, gotRedirectURI, gotRawQuery string
 	hits := fakeGitHubTokenEndpoint(t, func(r *http.Request) {
 		gotMethod, gotCT, gotRawQuery = r.Method, r.Header.Get("Content-Type"), r.URL.RawQuery
 		_ = r.ParseForm()
 		gotVerifier = r.PostForm.Get("code_verifier")
+		gotRedirectURI = r.PostForm.Get("redirect_uri")
 	})
 
 	s := &HubServer{logger: slog.Default(), hubSecret: testHubSecret}
@@ -196,6 +197,9 @@ func TestPKCE_CallbackSendsVerifierInFormBody(t *testing.T) {
 	}
 	if gotVerifier != verifier {
 		t.Errorf("code_verifier = %q, want the cookie verifier %q", gotVerifier, verifier)
+	}
+	if gotRedirectURI != oauthRedirectURI() || gotRedirectURI == "" {
+		t.Errorf("redirect_uri = %q, want %q", gotRedirectURI, oauthRedirectURI())
 	}
 	if gotRawQuery != "" {
 		t.Errorf("token request URL must carry no parameters, got %q", gotRawQuery)
