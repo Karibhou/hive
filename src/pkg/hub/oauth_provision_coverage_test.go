@@ -479,7 +479,8 @@ func TestExchangeGitHubLoginSendsFormPost(t *testing.T) {
 
 	s := &HubServer{logger: slog.Default()}
 	rec := httptest.NewRecorder()
-	if _, _, _, ok := s.exchangeGitHubLogin(rec, "code-789"); !ok {
+	verifier := strings.Repeat("v", 43)
+	if _, _, _, ok := s.exchangeGitHubLogin(rec, "code-789", verifier); !ok {
 		t.Fatalf("exchange failed: %d %s", rec.Code, rec.Body.String())
 	}
 	if gotMethod != http.MethodPost {
@@ -488,7 +489,7 @@ func TestExchangeGitHubLoginSendsFormPost(t *testing.T) {
 	if gotQuery != "" {
 		t.Errorf("token request URL query = %q, want empty", gotQuery)
 	}
-	for _, secret := range []string{"cid-123", "sekret-456", "code-789"} {
+	for _, secret := range []string{"cid-123", "sekret-456", "code-789", verifier} {
 		if strings.Contains(gotRawURL, secret) {
 			t.Errorf("token request URL %q leaks %q", gotRawURL, secret)
 		}
@@ -504,6 +505,7 @@ func TestExchangeGitHubLoginSendsFormPost(t *testing.T) {
 		"client_secret": "sekret-456",
 		"code":          "code-789",
 		"redirect_uri":  oauthRedirectURI(),
+		"code_verifier": verifier,
 	}
 	for k, v := range want {
 		if got := gotForm.Get(k); got != v {
