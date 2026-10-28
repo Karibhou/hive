@@ -138,7 +138,7 @@ func aggregateWithHeads(reports []PerspectiveReport, opts AggregateOptions) Aggr
 	}
 	settled, waiting := headsSettled(heads, final, opts.ExpectedHeads, missing)
 	complete := len(settledPerspectives(heads, final)) >= requiredPerspectiveCount(opts.MaxPerspectivesPerPR, opts.Perspectives.Len())
-	if settled && complete && headsClean(heads) && plainClean(final) {
+	if settled && complete && headsClean(allHeads) && plainClean(final) {
 		agg := aggregatePlainReports(append(append([]PerspectiveReport(nil), final...), heads...), opts)
 		if agg.Verdict == VerdictApprove {
 			agg.DecisionSkipped = true
