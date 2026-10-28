@@ -607,8 +607,8 @@ func (s *HubServer) startProviderLogin(w http.ResponseWriter, r *http.Request, p
 		// PKCE (RFC 7636, S256): mint a per-login code_verifier, keep it in its
 		// own short-lived host-scoped cookie (mirroring the state cookie), and
 		// send only its S256 challenge. The callback must present the verifier
-		// at token exchange, so an authorization code intercepted on its way
-		// back cannot be redeemed by anyone without this browser's cookie.
+		// at token exchange, binding the authorization code to the browser that
+		// started the login as defence-in-depth.
 		verifier, err := oauthPKCEVerifier()
 		if err != nil {
 			s.logger.Warn("OAuth: cannot mint PKCE verifier", "error", err)
