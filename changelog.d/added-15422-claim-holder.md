@@ -1,0 +1,1 @@
+- Show the holder of a local claim on the Activity Monitor chevron.
