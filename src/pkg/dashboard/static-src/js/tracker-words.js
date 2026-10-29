@@ -705,13 +705,6 @@
       if (dec) return dec;
       const laneReason = item && item.kind !== 'issue' && !stageTrackerCoverReasonText(item) ? item.reason : '';
       nowMs = typeof nowMs === 'number' ? nowMs : Date.now();
-      // Keep a queued member's label independent of the sweep clock. The
-      // sweep only changes the cue and tooltip, not its place in the train.
-      if (state === 'queued-behind' && src.merge_train) {
-        const train = src.merge_train;
-        const tip = stageTrackerTrainLines(src).join('. ') + (mg.sweep_running ? '. Checking now…' : '');
-        return { state, word: 'In merge queue · ' + (Number(train.position) || 0) + ' of ' + (Number(train.size) || 0), detail: '', tip, cue: mg.sweep_running ? 'running' : 'waiting', until: 0 };
-      }
       const word = stageTrackerMergeGateStateWord(state);
       const nextAt = mg.next_sweep_at ? Date.parse(mg.next_sweep_at) : 0;
       const lastAt = mg.last_sweep_at ? Date.parse(mg.last_sweep_at) : 0;

@@ -180,12 +180,6 @@ func TestStageTrackerMergeGateNode(t *testing.T) {
 		jsFunc(t, html, "stageTrackerMergeGateStateOf")+"\n"+
 		jsFunc(t, html, "stageTrackerShortLeft")+"\n"+
 		jsFunc(t, html, "stageTrackerGateReasonText")+"\n"+
-		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_STATE_FRONT")+"\n"+
-		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_STATE_REBASING")+"\n"+
-		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_STATE_EXHAUSTED")+"\n"+
-		jsFunc(t, html, "stageTrackerTrain")+"\n"+
-		jsFunc(t, html, "stageTrackerOrdinal")+"\n"+
-		jsFunc(t, html, "stageTrackerTrainLines")+"\n"+
 		stageTrackerMergeGateInfoJS(t, html)+"\n"+
 		jsFunc(t, html, "stageTrackerMergeGateWordHtml")+"\n"+
 		jsFunc(t, html, "stageTrackerGateCueHtml")+"\n"+
@@ -208,17 +202,6 @@ const pr15044 = { repo: 'hivecommons/hive', number: 15044, kind: 'pr', base_ref:
   merge_gate: { state: 'soaking', reason: 'contributor-lane:soaking(remaining=10m0s)', last_sweep_at: iso(now - 60000), next_sweep_at: iso(now + 200000), soak_until: iso(now + 452000), soak_remaining_seconds: 452 } };
 const ready = { repo: 'hivecommons/hive', number: 15060, kind: 'pr', stage: 80, merge_gate: { state: 'ready', last_sweep_at: iso(now - 10000), next_sweep_at: iso(now + 42000) } };
 const merging = { repo: 'hivecommons/hive', number: 15061, kind: 'pr', stage: 100, merge_gate: { state: 'merging', last_sweep_at: iso(now - 1000) } };
-
-// Queue position stays visible while only the cue changes during a sweep.
-const queued = { kind: 'pr', stage: 80, merge_gate: { state: 'queued-behind' }, merge_train: { state: 'queued-behind', id: 'v5#15315', front: 15315, position: 2, size: 3, ahead: [15315] } };
-const waiting = stageTrackerMergeGateInfo(queued, now);
-queued.merge_gate.sweep_running = true;
-const checking = stageTrackerMergeGateInfo(queued, now);
-assert.strictEqual(waiting.word, 'In merge queue · 2 of 3');
-assert.strictEqual(checking.word, waiting.word);
-assert.strictEqual(checking.detail, '');
-assert.strictEqual(waiting.cue, 'waiting'); assert.strictEqual(checking.cue, 'running');
-assert.ok(checking.tip.includes('Checking now…') && checking.tip.includes('#15315'));
 
 // Both 060 rows read the same word — neither is "Ready for auto merge" with CI pending.
 let a = stageTrackerMergeGateInfo(pr15042, now), b = stageTrackerMergeGateInfo(pr15054, now);

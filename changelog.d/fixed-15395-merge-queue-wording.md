@@ -1,1 +1,0 @@
-- The Activity Monitor keeps a queued merge-train position visible while a merge sweep runs.
