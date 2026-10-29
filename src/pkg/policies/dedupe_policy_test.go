@@ -58,7 +58,7 @@ func TestDedupePolicyShips(t *testing.T) {
 	// label instead (hivecommons/hive#11864).
 	for _, want := range []string{
 		"Decision required: <yes|no>",
-		"--label triage/advisory",
+		"Do not create an advisory-only checklist",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dedupe-issues.md is missing %q", want)

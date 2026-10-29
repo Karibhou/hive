@@ -552,6 +552,17 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		// spoke-local, so the body carries the relation too.
 		body = withParentMarker(body, req.Parent)
 	}
+	if kind == "issue" && emptyDedupeAdvisory(req.Body) {
+		reason := "not filed: dedupe advisory has no actionable findings or unchecked tasks"
+		if c.priorArtFilingRecord != nil {
+			c.priorArtFilingRecord("empty dedupe advisory not filed: "+req.Title, req.Body, req.Agent, req.Repo)
+		}
+		c.recordWriteAudit(AuditActionAgentIssueEmptyAdvisoryRefused, meta, WriteTarget{Repo: req.Repo})
+		c.writeIssueResult(path, IssueResponse{OK: false, Error: reason, At: nowFn().UTC().Format(time.RFC3339)})
+		_ = os.Remove(path)
+		c.issueClearRetry(path)
+		return
+	}
 	if kind == "issue" {
 		// Prior-art filing verdict (hivecommons/hive#13879). A refusal is
 		// terminal: retrying the same request cannot change the match.
