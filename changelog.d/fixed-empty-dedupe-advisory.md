@@ -1,1 +1,0 @@
-- Empty dedupe advisories with no actionable findings are no longer filed as issues.

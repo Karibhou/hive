@@ -61,6 +61,8 @@ type repoItemDecisionMock struct {
 	// already-fixed rung of hivecommons/hive#15289.
 	prBody             string
 	fixedIssueClosedBy int
+	// issueTitle / issueBody shape issue #7 (empty = untitled, no body).
+	issueTitle, issueBody string
 }
 
 func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
@@ -82,7 +84,7 @@ func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
 			for _, label := range m.issueLabels {
 				labels = append(labels, map[string]string{"name": label})
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"number": 7, "state": "open", "labels": labels, "user": map[string]any{"login": "hive[bot]", "type": "Bot"}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 7, "state": "open", "title": m.issueTitle, "body": m.issueBody, "labels": labels, "user": map[string]any{"login": "hive[bot]", "type": "Bot"}})
 		case r.Method == http.MethodGet && (strings.HasSuffix(path, "/issues/8") || strings.HasSuffix(path, "/issues/9")):
 			n := 8
 			if strings.HasSuffix(path, "/issues/9") {
@@ -317,6 +319,32 @@ func TestRepoItemDecisionCloseWontFixCommentsAndCloses(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(decisionAuditActions(srv), ","), auditRepoItemDecisionClose) {
 		t.Fatalf("audit missing %s: %v", auditRepoItemDecisionClose, decisionAuditActions(srv))
+	}
+}
+
+// close-read (hivecommons/hive#15381): an advisory issue is closed as
+// completed through the same comment + close path; a PR is refused.
+func TestRepoItemDecisionCloseReadClosesAsCompleted(t *testing.T) {
+	mock := &repoItemDecisionMock{issueLabels: []string{"triage/advisory"}}
+	srv := newRepoItemDecisionServer(t, mock)
+
+	w := postRepoItemDecision(t, srv, 7, "writer", `{"decision":"close-read"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("close-read: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if len(mock.comments) != 1 || !strings.Contains(mock.comments[0], "Closed as read (advisory acknowledged) by @writer") {
+		t.Fatalf("comments = %v", mock.comments)
+	}
+	if len(mock.edits) != 1 || mock.edits[0]["state"] != "closed" || mock.edits[0]["state_reason"] != issueStateReasonCompleted {
+		t.Fatalf("edits = %v", mock.edits)
+	}
+	var resp repoItemDecisionResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Status != "closed" || resp.Result == nil || resp.Result.Outcome != "Closed as read (advisory acknowledged)." {
+		t.Fatalf("resp = %+v", resp)
+	}
+	if w := postRepoItemDecision(t, srv, 8, "writer", `{"decision":"close-read","type":"pr"}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("close-read on a PR: code=%d want 400 body=%s", w.Code, w.Body.String())
 	}
 }
 

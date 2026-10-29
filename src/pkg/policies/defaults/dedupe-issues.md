@@ -151,7 +151,7 @@ for maintainers.
 
 ## Conflicting PRs: merge order matters
 
-- PR #1262 pins the contract that PR #1249 changes — merge #1249 first, or fold the test into #1249 (kick output only)
+- [ ] PR #1262 pins the contract that PR #1249 changes — merge #1249 first, or fold the test into #1249
 
 ## Candidates to close as resolved
 
@@ -205,11 +205,20 @@ gh search issues --repo <owner/repo> --state open --match body "hive:dedupe-chec
   new ones. If the body changed, post **one** comment summarising the delta
   ("+2 near-duplicates, −3 resolved since <date>") so watchers are notified
   once. If nothing changed, **post nothing** — silence is the correct outcome.
-- **No checklist exists and you have at least one action-required `- [ ]` task** → open one
-  with the command below.
-- **No checklist exists and there are no action-required tasks** → file nothing.
-  Merge-order reminders, cross-links and checked non-duplicates are notes for the
-  kick output, not findings that justify an issue.
+- **No checklist exists and you have at least one action-required row** (a
+  near-duplicate pair, a candidate to close as resolved, a missing PR↔issue
+  link, a consolidation close — each written as a `- [ ] #N …` task line) →
+  open one with the command below.
+- **No checklist exists and every row is advisory** → file nothing. Merge-order
+  reminders already declared in a PR body, "related but distinct" cross-links
+  and "checked and not duplicates" entries are notes, not work: a maintainer
+  has nothing to do with them, no agent picks them up, and the issue sits in
+  the dashboard looking like stalled work. Put the notes in your kick output
+  (one paragraph) and stop. The relay refuses the create for a
+  dedupe-checklist body whose verdict is `no` with zero near-duplicate pairs,
+  zero resolved candidates, zero missing links and no task lines.
+- **No checklist exists and you found nothing** → file nothing. A checklist that
+  says "no duplicates" is noise.
 
 Every checklist must stay out of the hive's work queue — an agent handed "close
 #1210 as superseded" as a task would do exactly the thing this lane is forbidden
@@ -236,7 +245,18 @@ gh issue create --repo <owner/repo> --needs-decision \
   --body-file /tmp/<unique>.md
 ```
 
-Do not create an advisory-only checklist. Put informational notes in the kick output.
+An **advisory-only** checklist (`Decision required: no`) is only ever the
+result of editing an existing checklist in place whose action rows have all
+since closed — never a fresh filing. It has nothing to decide,
+so it is **not** parked: no `--needs-decision`, no "What to reply" notice, no
+`needs-decision` entry in the dashboard's held bucket. File it with the
+`triage/advisory` label instead, which keeps it out of the work queue:
+
+```bash
+gh issue create --repo <owner/repo> --label triage/advisory \
+  --title "triage: duplicate and overlapping open issues/PRs to consolidate" \
+  --body-file /tmp/<unique>.md
+```
 
 When you edit an existing checklist in place, recompute the verdict and rewrite
 line two. If an advisory checklist gains an action-required row, say so on the

@@ -58,7 +58,7 @@ func TestDedupePolicyShips(t *testing.T) {
 	// label instead (hivecommons/hive#11864).
 	for _, want := range []string{
 		"Decision required: <yes|no>",
-		"Do not create an advisory-only checklist",
+		"--label triage/advisory",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dedupe-issues.md is missing %q", want)
@@ -66,6 +66,17 @@ func TestDedupePolicyShips(t *testing.T) {
 	}
 	if !strings.Contains(body, "<!-- hive:dedupe-checklist repo=<owner/repo> -->\nDecision required: <yes|no>\n") {
 		t.Error("dedupe-issues.md template must put the Decision required verdict directly under the marker line")
+	}
+	// An advisory-only pass never opens a new checklist (hivecommons/hive#15381):
+	// merge-order reminders and cross-links go to the kick output.
+	for _, want := range []string{
+		"every row is advisory** → file nothing",
+		"never a fresh filing",
+		"The relay refuses the create for a",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dedupe-issues.md is missing %q", want)
+		}
 	}
 
 	// Recommendations only: the lane must forbid itself the actions whose

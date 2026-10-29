@@ -4,10 +4,16 @@
     // light the segment they branch from (stageTrackerColumn in Go).
     // kind is 'issue' or 'pr': an issue parked on a person (045, or a
     // pre-045 085) is parked before any PR exists, so it lights Actionable
-    // rather than the merge gate.
-    function stageTrackerAnchor(stage, stages, kind) {
+    // rather than the merge gate. item (optional) is the row: once a merge
+    // call has been made on its head (merge_gate.state merging /
+    // merge-failed) the outcome is a Merge gate matter whatever numeric
+    // stage the lane fell back to — hivecommons/docs#512 drew "Merge
+    // failed" in CI / Review because the PR sat at 060.
+    function stageTrackerAnchor(stage, stages, kind, item) {
       const cur = Number(stage) || 0;
       if (cur >= STAGE_TRACKER_TERMINAL) return STAGE_TRACKER_TERMINAL;
+      const mg = item && item.merge_gate;
+      if (mg && (mg.state === 'merging' || mg.state === 'merge-failed') && cur > STAGE_TRACKER_PR_COLUMN) return STAGE_TRACKER_MERGE_COLUMN;
       if (cur === STAGE_TRACKER_ISSUE_NEEDS_DECISION || cur === STAGE_TRACKER_TRIAGE_NEEDED || cur === STAGE_TRACKER_POSSIBLY_EXISTS) return STAGE_TRACKER_ISSUE_DECISION_COLUMN;
       if (cur === STAGE_TRACKER_NEEDS_DECISION && kind === 'issue') return STAGE_TRACKER_ISSUE_DECISION_COLUMN;
       if (STAGE_TRACKER_PATH.indexOf(cur) >= 0) return cur;
@@ -29,7 +35,7 @@
       (stages || []).forEach(st => { byNum[st.number] = st; });
       const cur = Number(item.stage) || 0;
       const curStage = byNum[cur] || {};
-      const anchor = stageTrackerAnchor(cur, stages, item.via_pr ? 'pr' : item.kind);
+      const anchor = stageTrackerAnchor(cur, stages, item.via_pr ? 'pr' : item.kind, item);
       const terminal = anchor >= STAGE_TRACKER_TERMINAL;
       const sentinelLane = stageTrackerSentinelInLane(item);
       const detour = (!terminal && STAGE_TRACKER_PATH.indexOf(cur) < 0 && cur !== STAGE_TRACKER_TRIAGE_NEEDED && cur !== STAGE_TRACKER_POSSIBLY_EXISTS && cur !== 40 && cur !== 60 && cur !== STAGE_TRACKER_PRE_MERGE_SOAK && cur !== 100)
@@ -63,19 +69,22 @@
         // 000-new: the payload says nothing has placed the item yet and
         // names who moves it next (hivecommons/hive#15094).
         const openNew = n === 0 && state === 'active' && !openHold && !openBlocked && !openDraft && typeof stageTrackerNewState === 'function' && !!stageTrackerNewState(item);
+        const advisory = n === 0 && state === 'active' && !openHold && !openBlocked && typeof stageTrackerAdvisoryOf === 'function' ? stageTrackerAdvisoryOf(item) : null;
         if (openHold) word = 'Open · hold';
         else if (openBlocked) word = 'Open · blocked';
+        else if (advisory) word = advisory.chip || 'Advisory · read & close';
         else if (openDraft) word = 'Draft';
         else if (openNew) word = 'New';
         // A plain, blocked or draft Open step (no stage label, not held)
         // says how long it has sat there, from the same instant the since
-        // column shows — a stale blocked item is exactly what should stand out.
+        // column shows — a stale blocked item is exactly what should stand
+        // out. An advisory never does: nothing waits on it.
         let openSince = null;
-        if (n === 0 && state === 'active' && !openHold && !detour && nowMs) {
+        if (n === 0 && state === 'active' && !openHold && !advisory && !detour && nowMs) {
           const os = stageTrackerOpenSince(item);
           if (os.ms) { word += ' · since ' + stageTrackerShortAgo(nowMs - os.ms); openSince = Object.assign({ stale: !openDraft && nowMs - os.ms > STAGE_TRACKER_OPEN_STALE_DAYS * 86400000 }, os); }
         }
-        return { number: n, code: n ? String(n).padStart(3, '0') : '', short: word, label: tipStage.label || st.label || String(n), description: tipStage.description || st.description || '', state, terminal: false, detour: n === anchor ? detour : null, hold: openHold, blocked: openBlocked, draft: openDraft, isNew: openNew, openSince };
+        return { number: n, code: n ? String(n).padStart(3, '0') : '', short: word, label: (typeof stageTrackerStageName === 'function' && (stageTrackerStageName(tipStage) || stageTrackerStageName(st))) || tipStage.label || st.label || String(n), description: tipStage.description || st.description || '', state, terminal: false, detour: n === anchor ? detour : null, hold: openHold, blocked: openBlocked, draft: openDraft, isNew: openNew && !advisory, advisory: !!advisory, openSince };
       });
       segs.push({ number: STAGE_TRACKER_TERMINAL, code: '', short: 'Merged', label: 'Merged', description: 'Merged — the pipeline is complete', state: terminal ? 'active' : 'todo', terminal, cap: true, detour: null });
       return segs;
@@ -175,6 +184,14 @@
       return state + (sa.kind === 'bot' ? ' · bot PR' : ' · nobody on it');
     }
 
+    // Advisory (hivecommons/hive#15381): a payload `advisory` block means
+    // the issue is a note for maintainers, not work — the chevron word is
+    // its chip, it never reads stale or "since Nh", and the row action is
+    // Close (read). Pure so the fixture tests can lift it by name.
+    function stageTrackerAdvisoryOf(item) {
+      if (!item || item.kind === 'pr' || !item.advisory || typeof item.advisory !== 'object') return null;
+      return item.advisory;
+    }
     // 000-new (hivecommons/hive#15094): a payload `new` block on a stage-0
     // row means nothing has placed the item yet. These are pure so the
     // fixture tests can lift them by name.
@@ -265,7 +282,7 @@
         if (sg.number < from || sg.number > to) return `<li class="ham-seg blank${sg.cap ? ' cap' : ''}" aria-hidden="true"></li>`;
         const sentinel = !!(sg.detour && sg.detour.sentinel);
         const sentinelSuffix = !!(sg.detour && sg.detour.sentinelSuffix);
-        const cls = ['ham-seg', sg.state, sg.cap ? 'cap' : '', sg.cap && sg.terminal ? 'merged' : '', sg.detour ? 'detoured' : '', sg.hold ? 'ham-open-hold' : '', sg.blocked ? 'ham-open-blocked' : '', sg.draft ? 'ham-open-draft' : '', sg.isNew ? 'ham-open-new' : '', sg.openSince && sg.openSince.stale ? 'ham-open-stale' : '', sentinel || sentinelSuffix ? 'ham-sentinel' : ''].filter(Boolean).join(' ');
+        const cls = ['ham-seg', sg.state, sg.cap ? 'cap' : '', sg.cap && sg.terminal ? 'merged' : '', sg.detour ? 'detoured' : '', sg.hold ? 'ham-open-hold' : '', sg.blocked ? 'ham-open-blocked' : '', sg.draft ? 'ham-open-draft' : '', sg.isNew ? 'ham-open-new' : '', sg.advisory ? 'ham-open-advisory' : '', sg.openSince && sg.openSince.stale ? 'ham-open-stale' : '', sentinel || sentinelSuffix ? 'ham-sentinel' : ''].filter(Boolean).join(' ');
         const active = sg.state === 'active';
         let tip = '';
         if (active) {
@@ -273,6 +290,7 @@
           if (sg.blocked) tip += ' — ' + stageTrackerBlockedTip(item);
           if (sg.draft) tip += ' — ' + STAGE_TRACKER_DRAFT_TIP;
           if (sg.isNew && typeof stageTrackerNewLines === 'function') tip = 'New — ' + stageTrackerNewLines(item, nowMs).join(' — ');
+          if (sg.advisory) tip = (item.advisory && item.advisory.caption) || 'Advisory for maintainers · read, then close';
           if (sg.openSince) tip += ' — open since ' + new Date(sg.openSince.ms).toISOString() + (sg.openSince.fromCreated ? ' (opened)' : '');
           // The shared Merge gate word hides 080 vs 095 vs 100; the chevron tooltip carries it.
           // With merge_gate in the payload the sentence is the gate's own
@@ -283,7 +301,8 @@
           else if (curStage === STAGE_TRACKER_PRE_MERGE_SOAK) tip = sg.label + ' — admitted, soaking' + stageTrackerSoakLeft(item);
           else if (curStage === 100) tip = sg.label + ' — admitted, merging';
           // Why a person merges a 090 PR leads its tooltip (hivecommons/hive#14658).
-          else if (curStage === STAGE_TRACKER_READY_FOR_HUMAN_MERGE && item.human_merge_reason_text) tip = ((sg.detour && sg.detour.text) || sg.label) + ' — ' + String(item.human_merge_reason_text).trim() + (sg.description ? ' — ' + sg.description : '');
+          // The reason is the whole story; the stage description would only repeat it (hivecommons/hive#15394).
+          else if (curStage === STAGE_TRACKER_READY_FOR_HUMAN_MERGE && item.human_merge_reason_text) tip = ((sg.detour && sg.detour.text) || sg.label) + ' — ' + String(item.human_merge_reason_text).trim();
           if (actorTip && !sg.cap) tip += actorTip;
           // The sentinel's reason leads the lane tooltip so the security
           // implication is read before the stage mechanics.
@@ -402,6 +421,8 @@
     // Row tooltip: headline, reason, repo, author, flags, since, recent hops.
     function stageTrackerTooltip(item, nowMs) {
       const ak = item.author_kind || '';
+      // Plain words for author_kind in hover text (hivecommons/hive#15394).
+      const akPlain = { human: 'person', clanker: 'agent', hive: 'hive', bot: 'bot' };
       const mods = Array.isArray(item.modifiers) ? item.modifiers : [];
       const sinceMs = Date.parse(item.stage_since || '');
       const trail = stageTrackerTrailText(item);
@@ -409,10 +430,10 @@
       const lines = openHeld
         ? [stageTrackerHeadline(item) + (item.caption || item.reason ? ' · ' + (item.caption || item.reason) : '') + (item.repo ? ' · ' + item.repo : '')]
         : [stageTrackerHeadline(item), item.caption || item.reason || '', item.repo || ''];
-      if (item.author || ak) lines.push('Author: ' + (item.author ? '@' + item.author : '') + (ak ? ' (author/' + ak + (item.author_kind_source === 'inferred' ? ', inferred' : '') + ')' : '') + (item.tier ? ' · ' + item.tier : ''));
+      if (item.author || ak) lines.push('Author: ' + (item.author ? '@' + item.author : '') + (ak ? ' (' + (akPlain[ak] || ak) + (item.author_kind_source === 'inferred' ? ', inferred' : '') + ')' : '') + (item.tier ? ' · ' + item.tier : ''));
       if (item.origin) lines.push('Origin: origin/' + item.origin);
       if (item.kind === 'issue' && Array.isArray(item.linked_prs) && item.linked_prs.length) lines.push('Covering PR: ' + item.linked_prs.map(lp => Number(lp.number) || 0).sort((x, y) => x - y).map(n => '#' + n).join(', '));
-      else if (item.kind === 'issue' && item.linked_pr) lines.push('Covering PR: #' + item.linked_pr);
+      else if (item.kind === 'issue' && item.linked_pr) lines.push('Covering PR: #' + item.linked_pr + (typeof stageTrackerLineageClause === 'function' ? stageTrackerLineageClause(item) : ''));
       const actorLine = stageTrackerActorTip(item);
       if (actorLine) lines.push(actorLine.replace(/^ · /, ''));
       if (typeof stageTrackerNewLines === 'function') lines.push(...stageTrackerNewLines(item, nowMs));
@@ -438,7 +459,8 @@
       if (mods.indexOf('hold') >= 0 && typeof stageTrackerHoldPill === 'function' && stageTrackerHoldPill(item)) lines.push(stageTrackerHoldPill(item));
       if (sinceMs) lines.push('Since ' + agentNowClockTime(sinceMs, nowMs) + ' · ' + agentNowAgo(nowMs - sinceMs));
       if (trail) lines.push('Trail: ' + trail);
-      return lines.filter(Boolean).join('\n');
+      // Say it once: a line the caption already said is not repeated (hivecommons/hive#15394).
+      return lines.filter((l, i) => l && lines.indexOf(l) === i).join('\n');
     }
 
     // The sentinel chip: drawn in the chip area (beside needs rebase /
@@ -555,7 +577,7 @@
        request still on the wire) is a different thing drawn on the chevron;
        this badge appears once the server has recorded the action. */
     const STAGE_TRACKER_ACTED_LABELS = {
-      approve: 'Approve', 'give-direction': 'Give direction', 'close-superseded': 'Close as superseded', wontfix: "Close as won't-fix",
+      approve: 'Approve', 'give-direction': 'Give direction', 'close-superseded': 'Close as superseded', wontfix: "Close as won't-fix", 'close-read': 'Closed (read)',
       'let-hive-decide': 'Let hive decide', hold: 'Hold', release: 'Release hold', 'accept-triage': 'Accept triage', 'mark-needs-human': 'Mark needs-human',
       'merge-now': 'Approve & merge as maintainer', 'queue-merge': 'Approve — let hive merge',
       adopt: 'Adopt', 'adopt-now': 'Adopt now', reroute: 'Reroute to another clanker',
@@ -669,7 +691,7 @@
     }
     // Row-menu action id each ledger action was submitted under, so the
     // option the owner just took is not offered back to them.
-    const STAGE_TRACKER_ACTED_OPTION_ID = { 'let-hive-decide': 'decide:delegate', approve: 'decide:approve', 'give-direction': 'decide:direction', 'close-superseded': 'decide:close-superseded', wontfix: 'decide:close-wontfix', 'accept-triage': 'accept-triage', hold: 'hold', 'merge-now': 'decide:merge-now', 'queue-merge': 'decide:queue-merge', 're-author': 'decide:re-author', adopt: 'decide:adopt', 'adopt-now': 'decide:adopt-now', reroute: 'decide:reroute' };
+    const STAGE_TRACKER_ACTED_OPTION_ID = { 'let-hive-decide': 'decide:delegate', approve: 'decide:approve', 'give-direction': 'decide:direction', 'close-superseded': 'decide:close-superseded', wontfix: 'decide:close-wontfix', 'close-read': 'decide:close-read', 'accept-triage': 'accept-triage', hold: 'hold', 'merge-now': 'decide:merge-now', 'queue-merge': 'decide:queue-merge', 're-author': 'decide:re-author', adopt: 'decide:adopt', 'adopt-now': 'decide:adopt-now', reroute: 'decide:reroute' };
     // Pure: what the owner can still do when their action changed nothing
     // (no-op) or the item has not moved (stuck): the enabled options from
     // the row's decision_needed payload, minus the one just taken.
@@ -823,7 +845,7 @@
         human_approver: lp.human_approver || '', manual_merge: !!lp.manual_merge, human_merge_reason: lp.human_merge_reason || '', human_merge_reason_text: lp.human_merge_reason_text || '', sentinel_alert: !!lp.sentinel_alert, sentinel_reason: lp.sentinel_reason || '', head: lp.head || '', base_ref: lp.base_ref || '', decision_needed: lp.decision_needed || null,
         adoption: lp.adoption || null, takeover: lp.takeover || null, superseded: !!lp.superseded, supersedes: lp.supersedes || null, parent: Number(issue.number) || 0, siblings: open.map(x => Number(x.number) || 0),
         last_operator_action: lp.last_operator_action || null, operator_action_count: lp.operator_action_count || 0, hold: lp.hold || null, stage_actor: lp.stage_actor || null, presence: lp.presence || null, rework: lp.rework || null, merge_gate: lp.merge_gate || null, merge_train: lp.merge_train || null,
-        decided: lp.decided || null, adopted_by: Number(lp.adopted_by) || 0, adopted_by_state: lp.adopted_by_state || '', adopted_from: lp.adopted_from || null, state: lp.state || '', superseded_by: Number(lp.superseded_by) || 0 };
+        decided: lp.decided || null, adopted_by: Number(lp.adopted_by) || 0, adopted_by_state: lp.adopted_by_state || '', adopted_from: lp.adopted_from || null, lineage: lp.lineage || null, state: lp.state || '', superseded_by: Number(lp.superseded_by) || 0 };
     }
     // Pure: whether a linked PR is still open (not merged / closed / superseded).
     function stageTrackerLinkedPROpen(lp) {
@@ -833,6 +855,63 @@
     function stageTrackerNestedOpenPRs(issue) {
       if (!issue || issue.kind === 'pr') return [];
       return (Array.isArray(issue.linked_prs) ? issue.linked_prs : []).filter(stageTrackerLinkedPROpen).map(lp => stageTrackerLinkedPRItem(issue, lp));
+    }
+    // Lineage: where an adopted PR came from (`lineage`: {kind, from_number,
+    // from_url, from_author, from_author_kind, to_number, to_url, at,
+    // reason}; optional, nothing without it). #15198 showed the hive's copy
+    // #15308 "Fixing" with no trace of @thatguywob's #15226 it was adopted
+    // from, so sending the fix to a hive agent read as a mistake. The chip
+    // sits beside the PR number on every PR mention (top-level row, single
+    // covering PR, sub-row) and links to the other PR; the author's kind is
+    // the icon only, never a word.
+    const STAGE_TRACKER_LINEAGE_REASON_TIP = {
+      'ci-red-contributor-offline': "Hive took this PR over after CI went red and @AUTHOR's agent didn't respond. Original commits kept.",
+      'ci-red-contributor-unregistered': "Hive took this PR over after CI went red and @AUTHOR has no agent registered here. Original commits kept.",
+      'operator-asked': 'Hive took this PR over at a maintainer\'s request. Original commits kept.',
+      'dco-rehome': 'Hive re-homed this PR to repair its DCO sign-off. Original commits kept.',
+      'signoff-rehome': 'Hive re-homed this PR so its sign-off survives a squash. Original commits kept.',
+      'rebase-rehome': 'Hive re-homed this PR onto its own branch to finish the rebase. Original commits kept.',
+      'push-rehome': "Hive re-homed this PR because @AUTHOR's branch could no longer be pushed. Original commits kept.",
+      'in-place-stalled': 'Hive re-homed this PR after a review finding sat unaddressed. Original commits kept.'
+    };
+    // Pure: the chip's visible words — "adopted from @thatguywob's #15226 · 6h".
+    function stageTrackerLineageText(item, nowMs) {
+      const l = item && item.lineage;
+      if (!l || !l.kind) return '';
+      const ago = stageTrackerAgoText(Date.parse(l.at || ''), nowMs).replace(/ ago$/, '');
+      const tail = ago ? ' · ' + ago : '';
+      if (l.kind === 'superseded') return Number(l.to_number) > 0 ? 'superseded by #' + Number(l.to_number) + tail : '';
+      if (!(Number(l.from_number) > 0)) return '';
+      const whose = l.from_author ? '@' + l.from_author + "'s " : '';
+      return (l.kind === 'rebased-by-hive' ? 'rebased by hive from ' : 'adopted from ') + whose + '#' + Number(l.from_number) + tail;
+    }
+    // Pure: the hover — why the hive took it over, in plain words.
+    function stageTrackerLineageTip(item) {
+      const l = item && item.lineage;
+      if (!l || !l.kind) return '';
+      if (l.kind === 'superseded') return 'Hive took this PR over as #' + Number(l.to_number) + '; this original is closed when that merges.';
+      const who = l.from_author ? '@' + l.from_author : 'the contributor';
+      const tip = STAGE_TRACKER_LINEAGE_REASON_TIP[l.reason] || STAGE_TRACKER_LINEAGE_REASON_TIP['ci-red-contributor-offline'];
+      return tip.split('@AUTHOR').join(who);
+    }
+    function stageTrackerLineageChipHtml(item, nowMs) {
+      const text = stageTrackerLineageText(item, nowMs);
+      if (!text) return '';
+      const l = item.lineage;
+      const tip = stageTrackerLineageTip(item);
+      const icon = l.kind !== 'superseded' && l.from_author_kind ? stageTrackerIcon(l.from_author_kind, 'ham-author-ico ham-author-' + esc(l.from_author_kind), l.from_author_kind) : '';
+      const href = l.kind === 'superseded' ? l.to_url : l.from_url;
+      const attrs = `class="ham-badge ham-lineage" title="${esc(tip)}" aria-label="${esc(text + ' — ' + tip)}"`;
+      return href ? `<a ${attrs} href="${esc(href)}" target="_blank" rel="noopener">${icon}${esc(text)}</a>` : `<span ${attrs}>${icon}${esc(text)}</span>`;
+    }
+    // Pure: the one clause a caption or preview adds after the PR number —
+    // " (adopted from #15226)"; '' without lineage. An issue row reads its
+    // single covering PR's lineage.
+    function stageTrackerLineageClause(item) {
+      let l = item && item.lineage;
+      if (!l && item && item.kind === 'issue' && Array.isArray(item.linked_prs) && item.linked_prs.length === 1) l = item.linked_prs[0].lineage;
+      if (!l || !(Number(l.from_number) > 0) || l.kind === 'superseded') return '';
+      return ' (adopted from #' + Number(l.from_number) + ')';
     }
     // Pure: the "↳ adopted from #N · you let hive decide 17:51" chip on the
     // hive's copy of an adopted PR (hivecommons/hive#15126).
@@ -867,7 +946,7 @@
       return `<div class="ham-sub${typeof stageTrackerCueClasses === 'function' ? stageTrackerCueClasses(pr, ctx) : ''}" data-ham-kind="pr" data-ham-stage="${pr.stage}" data-ham-sub-key="${esc(stageTrackerItemKey(pr))}">
           ${typeof stageTrackerRowToolsHtml === 'function' ? stageTrackerRowToolsHtml(pr) : ''}
           <div class="ham-row-head">
-            ${stageTrackerHeadColsHtml([ref], '', stageTrackerActedBadgeHtml(pr, nowMs) + (typeof stageTrackerAdoptedFromChipHtml === 'function' ? stageTrackerAdoptedFromChipHtml(pr, nowMs) : '') + stageTrackerChipsHtml(pr))}
+            ${stageTrackerHeadColsHtml([ref], '', stageTrackerActedBadgeHtml(pr, nowMs) + ((typeof stageTrackerLineageChipHtml === 'function' ? stageTrackerLineageChipHtml(pr, nowMs) : '') || (typeof stageTrackerAdoptedFromChipHtml === 'function' ? stageTrackerAdoptedFromChipHtml(pr, nowMs) : '')) + stageTrackerChipsHtml(pr))}
           </div>
           <div class="ham-strip-row">
             <ol class="ham-strip" aria-label="Pipeline progress"${stageTrackerMoveAttrs(stageTrackerItemKey(pr), ctx)}>${stageTrackerStripItems(pr, stages, { from: STAGE_TRACKER_PR_COLUMN }, nowMs, ctx)}</ol>
@@ -897,7 +976,7 @@
     function stageTrackerLinkedSorted(item, stages) {
       const linked = Array.isArray(item.linked_prs) ? item.linked_prs.filter(lp => stageTrackerLinkedDrawnHere(lp, item)) : (item.linked_pr ? [{ number: item.linked_pr }] : []);
       const sinceOf = lp => Date.parse(lp.stage_since || '') || Infinity;
-      return linked.sort((x, y) => (stageTrackerAnchor(y.stage, stages, 'pr') - stageTrackerAnchor(x.stage, stages, 'pr')) || (stageTrackerAttentionTier(x) - stageTrackerAttentionTier(y)) || (sinceOf(x) - sinceOf(y)) || ((x.number || 0) - (y.number || 0)));
+      return linked.sort((x, y) => (stageTrackerAnchor(y.stage, stages, 'pr', y) - stageTrackerAnchor(x.stage, stages, 'pr', x)) || (stageTrackerAttentionTier(x) - stageTrackerAttentionTier(y)) || (sinceOf(x) - sinceOf(y)) || ((x.number || 0) - (y.number || 0)));
     }
 
     // Pure: a PR whose drawn_under issue is not a row of this page (filtered
@@ -930,7 +1009,7 @@
       const linked = item.kind === 'issue' ? stageTrackerLinkedSorted(item, stages) : [];
       const lead = linked.length && linked[0].stage ? linked[0] : item;
       const kind = lead === item ? item.kind : 'pr';
-      return { anchor: stageTrackerAnchor(lead.stage, stages, kind), since: Date.parse(lead.stage_since || '') || Infinity };
+      return { anchor: stageTrackerAnchor(lead.stage, stages, kind, lead), since: Date.parse(lead.stage_since || '') || Infinity };
     }
 
     /* ---- Repo chip and group-by-repo (pure; run under node by
@@ -1076,7 +1155,7 @@
           // One covering PR: a single entry whose strip the PR's stage drives.
           const lp = linked[0];
           const who = (lp.author_kind || 'hive') + (lp.author ? ' · @' + lp.author : '');
-          prRefs = [STAGE_TRACKER_LINKED_GLYPH + stageTrackerPRRef(lp.number, lp.url, lp.author_kind || '', lp.author, lp.title, (lp.title ? lp.title + '\n' : '') + 'Author: ' + who + ' · ' + stageTrackerLinkedTip(item, lp.number, ctx)) + (lp.base_ref ? ` <span class="ham-badge">${esc(lp.base_ref)}</span>` : '')];
+          prRefs = [STAGE_TRACKER_LINKED_GLYPH + stageTrackerPRRef(lp.number, lp.url, lp.author_kind || '', lp.author, lp.title, (lp.title ? lp.title + '\n' : '') + 'Author: ' + who + ' · ' + stageTrackerLinkedTip(item, lp.number, ctx)) + (lp.base_ref ? ` <span class="ham-badge">${esc(lp.base_ref)}</span>` : '') + (lp.lineage && typeof stageTrackerLineageChipHtml === 'function' ? ' ' + stageTrackerLineageChipHtml(lp, nowMs) : '')];
           shown = Object.assign({}, item, { via_pr: true, stage: lp.stage || 40, stage_since: lp.stage_since || item.stage_since, modifiers: lp.modifiers || item.modifiers, deferred_modifiers: lp.deferred_modifiers || item.deferred_modifiers || [], caption: lp.caption || item.caption, reason: lp.reason || item.reason,
             human_approver: lp.human_approver || '', manual_merge: !!lp.manual_merge, human_merge_reason: lp.human_merge_reason || '', human_merge_reason_text: lp.human_merge_reason_text || '', sentinel_alert: !!lp.sentinel_alert, sentinel_reason: lp.sentinel_reason || '', head: lp.head || '', decision_needed: lp.decision_needed || null, hold: lp.hold || null, adoption: lp.adoption || null, stage_actor: lp.stage_actor || item.stage_actor || null, presence: lp.presence || null, rework: lp.rework || null, merge_gate: lp.merge_gate || null, merge_train: lp.merge_train || null, decided: lp.decided || item.decided || null });
         } else if (linked.length) {
@@ -1113,7 +1192,7 @@
           </div>`;
       } else {
         const li = stageTrackerPRIssueSlot(item);
-        prRefs = [stageTrackerPRRef(item.number, item.url, item.author_kind || '', item.author, title, (title ? title + ' · ' : '') + stageTrackerTooltip(shown, nowMs))];
+        prRefs = [stageTrackerPRRef(item.number, item.url, item.author_kind || '', item.author, title, (title ? title + ' · ' : '') + stageTrackerTooltip(shown, nowMs)) + (item.lineage && typeof stageTrackerLineageChipHtml === 'function' ? ' ' + stageTrackerLineageChipHtml(item, nowMs) : '')];
         leadHtml = li.number
           ? `<div class="ham-head-main${li.closed ? ' ham-issue-closed' : ''}">
             ${stageTrackerIcon('issue', 'ham-kind-ico')}${chip}
