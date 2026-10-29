@@ -7841,7 +7841,7 @@ func runEvalCycle(
 			onReviewDelivered: func(msg scheduler.KickMessage) {
 				if k, ok := reviewKickByMessage[msg.Agent+"\x00"+msg.Message]; ok {
 					deliveredReviewKicks = append(deliveredReviewKicks, k)
-					persistReviewDispatchState(reviewPlan, deliveredReviewKicks, logger)
+					persistReviewDispatchStateIntermediate(reviewPlan, deliveredReviewKicks, logger)
 				}
 			},
 			onFailed: func(msg scheduler.KickMessage, err error) {
@@ -11407,6 +11407,19 @@ func postReviewAcknowledgements(ctx context.Context, poster reviewCommentPoster,
 			continue
 		}
 		logger.Info("review heads: posted the no-findings acknowledgement", "repo", a.Repo, "pr", a.Number, "head_sha", a.HeadSHA)
+	}
+}
+
+// Intermediate delivery checkpoints retain all planned pending entries: other
+// kicks in this pass may still be in flight. Final reconciliation releases
+// those that were never delivered.
+func persistReviewDispatchStateIntermediate(plan review.DispatchPlan, delivered []review.DispatchKick, logger *slog.Logger) {
+	if plan.State.GeneratedAt.IsZero() && len(plan.ReviewKicks) == 0 && len(plan.FixKicks) == 0 {
+		return
+	}
+	state := review.ConfirmDelivered(plan.State, nil, delivered)
+	if err := review.WriteDispatchState("", state); err != nil {
+		logger.Warn("failed to persist review dispatch state", "error", err)
 	}
 }
 

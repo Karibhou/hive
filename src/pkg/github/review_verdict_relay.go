@@ -537,6 +537,25 @@ func (c *Client) verdictDispatchAuthorized(report review.PerspectiveReport, req 
 		}
 		return verdictAuthorization{OK: true, Dispatched: true, HeadSHA: r.HeadSHA, BodyDigest: r.BodyDigest, HiveAuthored: strings.TrimSpace(r.AuthorAgent) != "", ReviewHead: strings.TrimSpace(r.Head), Decided: r.Decision}
 	}
+	// Record the rows considered when a dispatched reviewer falls back to
+	// advisory, so a missing or mismatched decision dispatch is diagnosable.
+	var candidates []string
+	dispatchedAgent := false
+	for _, p := range state.Pending {
+		if strings.EqualFold(strings.TrimSpace(p.Repo), strings.TrimSpace(report.Repo)) && p.Number == report.Number {
+			candidates = append(candidates, fmt.Sprintf("pending agent=%s perspective=%s head=%s decision=%t", p.Agent, p.Perspective, p.HeadSHA, p.Decision))
+			dispatchedAgent = dispatchedAgent || strings.TrimSpace(p.Agent) == strings.TrimSpace(req.Agent)
+		}
+	}
+	for _, r := range state.Recent {
+		if strings.EqualFold(strings.TrimSpace(r.Repo), strings.TrimSpace(report.Repo)) && r.Number == report.Number {
+			candidates = append(candidates, fmt.Sprintf("recent agent=%s perspective=%s head=%s decision=%t", r.Agent, r.Perspective, r.HeadSHA, r.Decision))
+			dispatchedAgent = dispatchedAgent || strings.TrimSpace(r.Agent) == strings.TrimSpace(req.Agent)
+		}
+	}
+	if dispatchedAgent && c.logger != nil {
+		c.logger.Info("review verdict falling back to advisory", "repo", report.Repo, "number", report.Number, "agent", req.Agent, "perspective", report.Perspective, "head", report.HeadSHA, "candidates", candidates)
+	}
 	// Queue-mode reviewer prompts can reach the relay through the ordinary
 	// PR-list comment path rather than a review-swarm dispatch. That still is
 	// an authorized hive-review request, and with an explicit head SHA it is

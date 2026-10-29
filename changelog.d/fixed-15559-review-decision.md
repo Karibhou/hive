@@ -1,0 +1,1 @@
+- Preserve in-flight review decision dispatches during delivery so their verdicts can bind to the intended decision ([#15559](https://github.com/hivecommons/hive/issues/15559)).

@@ -357,6 +357,33 @@ func TestPersistReviewDispatchState_KeepsOnlyDeliveredKicks(t *testing.T) {
 	}
 }
 
+func TestIntermediateReviewDispatchStateKeepsInFlightDecision(t *testing.T) {
+	redirectReviewPaths(t)
+	now := time.Now().UTC()
+	first := review.DispatchKick{Kind: "review", Agent: "head", Repo: "o/r", Number: 42, HeadSHA: reviewTestSHA, Perspective: review.PerspectiveSecurity}
+	decision := review.DispatchKick{Kind: "review", Agent: "reviewer", Repo: "o/r", Number: 42, HeadSHA: reviewTestSHA, Perspective: review.PerspectiveCorrectness, Decision: true}
+	plan := review.DispatchPlan{ReviewKicks: []review.DispatchKick{first, decision}, State: review.DispatchState{GeneratedAt: now, Pending: []review.PendingReview{
+		{Repo: first.Repo, Number: first.Number, HeadSHA: first.HeadSHA, Perspective: first.Perspective, Agent: first.Agent, Dispatched: now},
+		{Repo: decision.Repo, Number: decision.Number, HeadSHA: decision.HeadSHA, Perspective: decision.Perspective, Agent: decision.Agent, Decision: true, Dispatched: now},
+	}}}
+	persistReviewDispatchStateIntermediate(plan, []review.DispatchKick{first}, restoreTestLogger())
+	state, err := review.LoadDispatchState("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Pending) != 2 || !state.Pending[1].Decision {
+		t.Fatalf("intermediate pending = %+v, want in-flight decision", state.Pending)
+	}
+	persistReviewDispatchState(plan, []review.DispatchKick{first}, restoreTestLogger())
+	state, err = review.LoadDispatchState("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Pending) != 1 || state.Pending[0].Agent != first.Agent {
+		t.Fatalf("final pending = %+v, want only delivered kick", state.Pending)
+	}
+}
+
 func TestPersistReviewDispatchState_WriteFailureIsNonFatal(t *testing.T) {
 	dir := redirectReviewPaths(t)
 	// Point the state file inside a plain file so MkdirAll/rename must fail.
