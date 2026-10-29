@@ -198,6 +198,11 @@
       const c = item && item.claimant;
       return c && typeof c === 'object' && c.kind && (c.login || c.agent) ? c : null;
     }
+    // The strip icon for a holder's kind: ⬡ hive agent, robot clanker, person.
+    const STAGE_TRACKER_CLAIMANT_ICON = { 'hive-agent': 'hive', clanker: 'clanker', person: 'human' };
+    function stageTrackerClaimantIconKind(c) {
+      return (c && STAGE_TRACKER_CLAIMANT_ICON[c.kind]) || 'human';
+    }
     // "quality", "quality@alchemy", "@alice" or "@bob's clanker"; '' when unknown.
     function stageTrackerClaimantShort(c) {
       if (!c) return '';
@@ -331,6 +336,11 @@
       const claimant = typeof stageTrackerClaimant === 'function' ? stageTrackerClaimant(item) : null;
       const holderShort = claimant ? stageTrackerClaimantShort(claimant) : '';
       const holderHtml = holderShort ? `<span class="ham-holder"> · ${esc(holderShort)}</span>` : '';
+      // A row whose next mover is nobody (an unclassified PR under its
+      // issue reads "PR in progress") still shows WHO holds it: the
+      // holder's own kind icon stands where the actor icon would
+      // (hivecommons/hive#15541).
+      const holderIco = holderShort && !actorIco ? stageTrackerIcon(stageTrackerClaimantIconKind(claimant), 'ham-ico ham-actor-ico', stageTrackerClaimantLine(claimant, nowMs)) : '';
       // Static chevrons carry no data-motion: the CSS only animates the two
       // moving buckets. The hive-acting pulse needs an agent actually on
       // the item (tracker-cues: working); a hive stage with nobody on it is
@@ -384,7 +394,10 @@
         // On the merge gate the word carries its live detail and the
         // leading glyph says in words what hive is doing (#15073).
         const gateWord = active && !sg.cap && !sg.detour && typeof stageTrackerMergeGateWordHtml === 'function' ? stageTrackerMergeGateWordHtml(item, nowMs) : '';
-        const word = sg.detour ? `<span class="ham-detour">${esc(sg.detour.text)}${holderHtml}</span>` : (gateWord || `<span class="ham-seg-t">${esc(sg.short)}${holderHtml}</span>`);
+        // A detour word that already names the holder ("Returned to
+        // @bob's clanker") does not repeat them after the dot.
+        const detourHolder = sg.detour && holderShort && sg.detour.text.indexOf(holderShort) >= 0 ? '' : holderHtml;
+        const word = sg.detour ? `<span class="ham-detour${detourHolder ? ' ham-has-holder' : ''}">${esc(sg.detour.text)}${detourHolder}</span>` : (gateWord || `<span class="ham-seg-t${holderHtml ? ' ham-has-holder' : ''}">${esc(sg.short)}${holderHtml}</span>`);
         const gateCue = gateWord && typeof stageTrackerGateCueHtml === 'function' ? stageTrackerGateCueHtml(item, nowMs) : '';
         // The agent-working spinner (tracker-cues) names the agent and what
         // it did, so a spinning glyph is never unexplained.
@@ -393,7 +406,7 @@
         // The cap chevron is the ✓ only once the PR is merged; until then
         // the column is the row's history and wears the history mark.
         if (sg.cap) inner = sg.terminal ? stageTrackerIcon(sg.number, 'ham-ico') : stageTrackerIcon('history', 'ham-ico ham-history-ico', 'History — no decisions or actions recorded yet');
-        else if (active) inner = gateCue + workIco + (decision ? stageTrackerDecisionTriggerHtml(decision, word, tip) : word) + actorIco;
+        else if (active) inner = gateCue + workIco + (decision ? stageTrackerDecisionTriggerHtml(decision, word, tip) : word) + (actorIco || holderIco);
         else inner = stageTrackerIcon(sg.number, 'ham-ico');
         return `<li class="${cls}"${active ? `${sg.cap ? '' : motionAttr}${decision ? '' : ` title="${esc(tip)}"`} aria-current="step"` : ''}${sentinel ? ` aria-label="${esc(STAGE_TRACKER_SENTINEL_WORD + ' — ' + stageTrackerSentinelTip(item))}"` : (sentinelSuffix ? ` aria-label="${esc(sg.detour.text + ' — ' + stageTrackerSentinelTip(item))}"` : '')}>${inner}</li>`;
       }).join('');
@@ -907,7 +920,7 @@
     // parent issue's. `parent` names the issue; `siblings` the other open
     // PRs under it (the superseded-by prompt pre-fills the one sibling).
     function stageTrackerLinkedPRItem(issue, lp) {
-      const open = Array.isArray(issue.linked_prs) ? issue.linked_prs.filter(x => x && x.number !== lp.number && stageTrackerLinkedPROpen(x)) : [];
+      const open = Array.isArray(issue.linked_prs) ? issue.linked_prs.filter(x => x && x.number !== lp.number && stageTrackerLinkedPROpen(x, issue)) : [];
       return { repo: issue.repo, number: lp.number, kind: 'pr', title: lp.title || '', url: lp.url || '', author: lp.author || '', author_kind: lp.author_kind || '',
         stage: lp.stage || 0, stage_since: lp.stage_since || '', stage_slug: lp.stage_slug || '', modifiers: lp.modifiers || [], deferred_modifiers: lp.deferred_modifiers || [], caption: lp.caption || '', reason: lp.reason || '',
         human_approver: lp.human_approver || '', manual_merge: !!lp.manual_merge, human_merge_reason: lp.human_merge_reason || '', human_merge_reason_text: lp.human_merge_reason_text || '', sentinel_alert: !!lp.sentinel_alert, sentinel_reason: lp.sentinel_reason || '', head: lp.head || '', base_ref: lp.base_ref || '', decision_needed: lp.decision_needed || null,
@@ -915,14 +928,25 @@
         last_operator_action: lp.last_operator_action || null, operator_action_count: lp.operator_action_count || 0, hold: lp.hold || null, stage_actor: lp.stage_actor || null, claimant: lp.claimant || null, presence: lp.presence || null, rework: lp.rework || null, merge_gate: lp.merge_gate || null, merge_train: lp.merge_train || null,
         decided: lp.decided || null, adopted_by: Number(lp.adopted_by) || 0, adopted_by_state: lp.adopted_by_state || '', adopted_from: lp.adopted_from || null, lineage: lp.lineage || null, state: lp.state || '', superseded_by: Number(lp.superseded_by) || 0 };
     }
-    // Pure: whether a linked PR is still open (not merged / closed / superseded).
-    function stageTrackerLinkedPROpen(lp) {
-      return !!lp && !lp.superseded && String(lp.state || '') !== 'closed' && (Number(lp.stage) || 0) < STAGE_TRACKER_TERMINAL && (Array.isArray(lp.modifiers) ? lp.modifiers : []).indexOf('merged') < 0;
+    // Pure: whether a linked PR is still open (not merged / closed /
+    // superseded). With `issue`, an adopted original whose hive copy is
+    // listed under the same issue counts as superseded even while GitHub
+    // still has it open (the write-back gate kept it at 072): the pair
+    // {original, copy} is one logical PR, so #15495 never reads as "2
+    // PRs" needing a human to pick (hivecommons/hive#15495).
+    function stageTrackerLinkedPROpen(lp, issue) {
+      if (!lp || lp.superseded || String(lp.state || '') === 'closed' || (Number(lp.stage) || 0) >= STAGE_TRACKER_TERMINAL || (Array.isArray(lp.modifiers) ? lp.modifiers : []).indexOf('merged') >= 0) return false;
+      const by = Number(lp.superseded_by || lp.adopted_by) || 0;
+      if (by > 0 && issue && lp.adopted_by_state !== 'closed' && lp.adopted_by_state !== 'closed-twice' && lp.adopted_by_state !== 'copy-failed') {
+        const linked = Array.isArray(issue.linked_prs) ? issue.linked_prs : [];
+        if (linked.some(x => x && Number(x.number) === by && String(x.state || '') !== 'closed')) return false;
+      }
+      return true;
     }
     // Pure: an issue's open nested PRs as row items.
     function stageTrackerNestedOpenPRs(issue) {
       if (!issue || issue.kind === 'pr') return [];
-      return (Array.isArray(issue.linked_prs) ? issue.linked_prs : []).filter(stageTrackerLinkedPROpen).map(lp => stageTrackerLinkedPRItem(issue, lp));
+      return (Array.isArray(issue.linked_prs) ? issue.linked_prs : []).filter(lp => stageTrackerLinkedPROpen(lp, issue)).map(lp => stageTrackerLinkedPRItem(issue, lp));
     }
     // Lineage: where an adopted PR came from (`lineage`: {kind, from_number,
     // from_url, from_author, from_author_kind, to_number, to_url, at,
@@ -1243,7 +1267,7 @@
           // One covering PR: a single entry whose strip the PR's stage drives.
           const lp = linked[0];
           const who = (lp.author_kind || 'hive') + (lp.author ? ' · @' + lp.author : '');
-          prRefs = [STAGE_TRACKER_LINKED_GLYPH + stageTrackerPRPillsHtml(stageTrackerPRRef(lp.number, lp.url, lp.author_kind || '', lp.author, lp.title, (lp.title ? lp.title + '\n' : '') + 'Author: ' + who + ' · ' + stageTrackerLinkedTip(item, lp.number, ctx)), lp.lineage && typeof stageTrackerLineageChipHtml === 'function' ? stageTrackerLineageChipHtml(lp, nowMs) : null, lp.base_ref)];
+          prRefs = [STAGE_TRACKER_LINKED_GLYPH + stageTrackerPRPillsHtml(stageTrackerPRRef(lp.number, lp.url, lp.author_kind || '', lp.author, lp.title, (lp.title ? lp.title + '\n' : '') + 'Author: ' + who + ' · ' + stageTrackerLinkedTip(item, lp.number, ctx)), lp.lineage && typeof stageTrackerLineageChipHtml === 'function' ? (stageTrackerLineageChipHtml(lp, nowMs) || null) : null, lp.base_ref)];
           shown = Object.assign({}, item, { via_pr: true, stage: lp.stage || 40, stage_since: lp.stage_since || item.stage_since, modifiers: lp.modifiers || item.modifiers, deferred_modifiers: lp.deferred_modifiers || item.deferred_modifiers || [], caption: lp.caption || item.caption, reason: lp.reason || item.reason,
             human_approver: lp.human_approver || '', manual_merge: !!lp.manual_merge, human_merge_reason: lp.human_merge_reason || '', human_merge_reason_text: lp.human_merge_reason_text || '', sentinel_alert: !!lp.sentinel_alert, sentinel_reason: lp.sentinel_reason || '', head: lp.head || '', decision_needed: lp.decision_needed || null, hold: lp.hold || null, adoption: lp.adoption || null, stage_actor: lp.stage_actor || item.stage_actor || null, claimant: lp.claimant || null, presence: lp.presence || null, rework: lp.rework || null, merge_gate: lp.merge_gate || null, merge_train: lp.merge_train || null, decided: lp.decided || item.decided || null });
         } else if (linked.length) {
