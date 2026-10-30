@@ -147,7 +147,7 @@ func TestStageTrackerMergeGateNode(t *testing.T) {
 	for _, want := range []string{
 		`const STAGE_TRACKER_MERGE_GATE_WORD = { 'gate-pending': 'Review passed', ready: 'Ready for auto merge', soaking: 'Soaking', merging: 'Merging', merged: 'Merged', 'merge-failed': 'Merge failed' };`,
 		`60: 'Review passed', 80: 'Ready for auto merge', 95: 'Soaking', 100: 'Merging'`,
-		`const gateCue = gateWord && typeof stageTrackerGateCueHtml === 'function' ? stageTrackerGateCueHtml(item, nowMs) : '';`,
+		`const gateCue = gateWord && typeof stageTrackerGateCueHtml === 'function' ? stageTrackerGateCueHtml(item, nowMs, trains) : '';`,
 		`else if (active) inner = gateCue + workIco + (decision ? stageTrackerDecisionTriggerHtml(decision, word, tip) : word) + (actorIco || holderIco);`,
 		`if (gateInfo) tip = sg.label + ' — ' + gateInfo.tip;`,
 		`if (typeof stageTrackerGateCountdownSync === 'function') stageTrackerGateCountdownSync(el, nowMs);`,
@@ -322,6 +322,7 @@ func stageTrackerTrainQueueJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerOrdinal"),
 		jsFunc(t, html, "stageTrackerShortLeft"),
 		jsFunc(t, html, "stageTrackerTrainPlace"),
+		stageTrackerTrainProvisionalJS(t, html),
 		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_STALLED_LEAD"),
 		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_HEAD_STALL_WORD"),
 		jsFunc(t, html, "stageTrackerTrainStallWhy"),
@@ -332,6 +333,28 @@ func stageTrackerTrainQueueJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerTrainEtaDetail"),
 		jsFunc(t, html, "stageTrackerTrainQueueTip"),
 		jsFunc(t, html, "stageTrackerTrainLines"),
+	}, "\n")
+}
+
+// stageTrackerTrainProvisionalJS lifts the provisional-slot words: a train
+// member whose own stage is short of the merge gate reads its blocker
+// first and its slot as a suffix.
+func stageTrackerTrainProvisionalJS(t *testing.T, html string) string {
+	t.Helper()
+	return strings.Join([]string{
+		jsConstLine(t, html, "STAGE_TRACKER_MERGE_READY"),
+		jsConstLine(t, html, "STAGE_TRACKER_PROVISIONAL_STAGE_WORD"),
+		jsFunc(t, html, "stageTrackerTrainProvisional"),
+		jsFunc(t, html, "stageTrackerTrainProvisionalHeadline"),
+		jsFunc(t, html, "stageTrackerTrainProvisionalSuffix"),
+		jsFunc(t, html, "stageTrackerTrainOrdinalOfN"),
+		jsFunc(t, html, "stageTrackerTrainTag"),
+		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_TAG_LEAD"),
+		jsFunc(t, html, "stageTrackerTrainTagSuffix"),
+		jsFunc(t, html, "stageTrackerTrainTagTip"),
+		jsFunc(t, html, "stageTrackerTrainIndex"),
+		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_ACCENTS"),
+		jsFunc(t, html, "stageTrackerTrainAccentClass"),
 	}, "\n")
 }
 
