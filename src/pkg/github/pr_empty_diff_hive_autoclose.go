@@ -105,7 +105,9 @@ type HiveEmptyDiffAutoCloseFacts struct {
 	DiffKnown bool
 	DiffFiles int
 	// HeadAge is now minus the head commit's date when the compare
-	// reported one, else minus the PR's last update (or creation).
+	// reported one, else minus the PR's last update (or creation). It
+	// never exceeds the PR's own age: a PR just opened from an old branch
+	// is still a just-opened PR.
 	HeadAge time.Duration
 	// ReviewerConfirmed: the reviewer verdict for this very head says the
 	// change is already on the base. The head has been read, so the
@@ -185,7 +187,8 @@ func PRChangedFilesClaimsEmpty(pr *gh.PullRequest) bool {
 // prDiffAgainstBase measures the PR's diff as GitHub shows it: the compare
 // base...head. known is false when the compare failed or the file list
 // was cut short. headAt is the newest commit's committer date when the
-// compare listed commits (zero otherwise).
+// compare listed commits; when it listed none the head is already on the
+// base, so it is the merge base's date. Zero when neither is readable.
 func (c *Client) prDiffAgainstBase(ctx context.Context, owner, name string, pr *gh.PullRequest) (files []*gh.CommitFile, headAt time.Time, known bool) {
 	base := strings.TrimSpace(pr.GetBase().GetRef())
 	head := strings.TrimSpace(pr.GetHead().GetSHA())
@@ -200,6 +203,9 @@ func (c *Client) prDiffAgainstBase(ctx context.Context, owner, name string, pr *
 		if at := commit.GetCommit().GetCommitter().GetDate().Time; at.After(headAt) {
 			headAt = at
 		}
+	}
+	if mb := comparison.GetMergeBaseCommit(); len(comparison.Commits) == 0 && strings.EqualFold(mb.GetSHA(), head) {
+		headAt = mb.GetCommit().GetCommitter().GetDate().Time
 	}
 	if (resp != nil && resp.NextPage != 0) || len(comparison.Files) >= githubCompareFileLimit {
 		return comparison.Files, headAt, false
@@ -302,7 +308,7 @@ func (c *Client) closeHiveRedundantPR(ctx context.Context, repo string, pr *gh.P
 		HiveAuthored:      identity.Matches(safeGetLogin(pr.GetUser())),
 		Held:              c.isHeld(labels) || c.isExempt(labels),
 		KeptOpen:          supersessionHasLabel(pr, SupersessionKeepOpenLabel),
-		HeadAge:           emptyDiffHeadAge(pr, now),
+		HeadAge:           emptyDiffHeadAge(pr, time.Time{}, now),
 		ReviewerConfirmed: reviewed,
 	}
 	if pr.ChangedFiles != nil && *pr.ChangedFiles > 0 && !reviewed {
@@ -325,9 +331,7 @@ func (c *Client) closeHiveRedundantPR(ctx context.Context, repo string, pr *gh.P
 	if !facts.DiffKnown {
 		files, headAt, known := c.prDiffAgainstBase(ctx, owner, name, pr)
 		facts.DiffFiles, facts.DiffKnown = len(files), known
-		if !headAt.IsZero() {
-			facts.HeadAge = now.Sub(headAt)
-		}
+		facts.HeadAge = emptyDiffHeadAge(pr, headAt, now)
 		if known && len(files) > 0 && reviewed {
 			match, matchKnown := c.prFilesIdenticalOnBase(ctx, owner, name, strings.TrimSpace(pr.GetBase().GetRef()), files)
 			facts.TreeMatchesBase = match && matchKnown
@@ -377,8 +381,10 @@ func (c *Client) closeHiveRedundantPR(ctx context.Context, repo string, pr *gh.P
 // closeIssuesAlreadyLanded closes the issues pr's closing references name
 // once the PR itself is closed as already landed: the work is on the base,
 // so the issue gets the usual close (CloseIssue's tracking-issue and
-// reporter-confirmation gates included) with a note naming the PR that
-// landed it. Failures are logged, never fatal: the PR close stands.
+// reporter-confirmation gates included), then a note naming the PR that
+// landed it — only once the close went through, so a refused close leaves
+// no "done" note on an open issue. Failures are logged, never fatal: the
+// PR close stands.
 func (c *Client) closeIssuesAlreadyLanded(ctx context.Context, owner, name string, pr *gh.PullRequest, redundantOf int) []int {
 	repo := owner + "/" + name
 	var closed []int
@@ -391,13 +397,8 @@ func (c *Client) closeIssuesAlreadyLanded(ctx context.Context, owner, name strin
 		if d := c.WritebackAllowed(repo, item, writeback.KindIssueClose, "close issue already landed"); !d.Allowed {
 			continue
 		}
-		note := alreadyLandedIssueNote(pr.GetNumber(), redundantOf, strings.TrimSpace(pr.GetBase().GetRef()))
-		if _, _, err := c.client.Issues.CreateComment(ctx, owner, name, number, &gh.IssueComment{Body: gh.Ptr(note)}); err != nil { // writeback:gated
-			if c.logger != nil {
-				c.logger.Warn("already-landed auto-close: issue note failed", slog.String("repo", repo), slog.Int("issue", number), slog.String("error", err.Error()))
-			}
-			continue
-		}
+		// Close first: CloseIssue's gates may refuse, and a "this issue is
+		// done" note must never sit on an issue that stayed open.
 		if err := c.CloseIssue(ctx, repo, number, IssueCloseOptions{StateReason: IssueStateReasonCompleted}); err != nil { // writeback:gated
 			if c.logger != nil {
 				c.logger.Warn("already-landed auto-close: issue left open", slog.String("repo", repo), slog.Int("issue", number), slog.String("error", err.Error()))
@@ -405,6 +406,10 @@ func (c *Client) closeIssuesAlreadyLanded(ctx context.Context, owner, name strin
 			continue
 		}
 		closed = append(closed, number)
+		note := alreadyLandedIssueNote(pr.GetNumber(), redundantOf, strings.TrimSpace(pr.GetBase().GetRef()))
+		if _, _, err := c.client.Issues.CreateComment(ctx, owner, name, number, &gh.IssueComment{Body: gh.Ptr(note)}); err != nil && c.logger != nil { // writeback:gated
+			c.logger.Warn("already-landed auto-close: issue note failed", slog.String("repo", repo), slog.Int("issue", number), slog.String("error", err.Error()))
+		}
 	}
 	return closed
 }
@@ -418,10 +423,17 @@ func alreadyLandedIssueNote(pr, redundantOf int, base string) string {
 	return fmt.Sprintf("The hive closed its own #%d as superseded: the change it carried is already on `%s`, so this issue is done. Reopen if that's wrong.", pr, base)
 }
 
-func emptyDiffHeadAge(pr *gh.PullRequest, now time.Time) time.Duration {
-	at := pr.GetUpdatedAt().Time
+// emptyDiffHeadAge measures from the compare's newest commit (headAt) when
+// it is known; updated_at, which labels and comments bump, stands in only
+// when it is not. The age never exceeds the PR's own age: a PR just opened
+// from an old branch is still a just-opened PR whose commits may be arriving.
+func emptyDiffHeadAge(pr *gh.PullRequest, headAt, now time.Time) time.Duration {
+	at := headAt
 	if at.IsZero() {
-		at = pr.GetCreatedAt().Time
+		at = pr.GetUpdatedAt().Time
+	}
+	if created := pr.GetCreatedAt().Time; !created.IsZero() && created.After(at) {
+		at = created
 	}
 	if at.IsZero() {
 		return 0
