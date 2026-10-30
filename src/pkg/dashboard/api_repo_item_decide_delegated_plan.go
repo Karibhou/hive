@@ -189,7 +189,7 @@ func delegatedPlanWording(in delegatedecision.Input, d delegatedecision.Decision
 				ref + " is closed as superseded; the author keeps the credit.",
 			}
 	case d.Verdict == delegatedecision.VerdictApprove:
-		return "Approve " + ref + " as it is and let the merge gate merge it.",
+		return "Approve " + ref + " as it is and let the merge queue merge it.",
 			[]string{"Hive approves the current commit.", ref + " merges once CI is green and it has soaked."}
 	case d.Verdict == delegatedecision.VerdictCloseDuplicate && target > 0:
 		return "Close " + ref + " as a duplicate of #" + strconv.Itoa(target) + ".", []string{ref + " is closed with a comment pointing at #" + strconv.Itoa(target) + "."}
@@ -204,6 +204,12 @@ func delegatedPlanWording(in delegatedecision.Input, d delegatedecision.Decision
 		return "Do nothing: " + delegatedPlanPlain(d.Rationale) + ".", []string{"Nothing changes; " + ref + " stays waiting for you."}
 	case d.Verdict == delegatedecision.VerdictOwnerOnly:
 		return "Leave this to the owner.", []string{"Hive labels " + ref + " needs-owner and holds it.", "Only the owner can grant this."}
+	case d.Verdict == delegatedecision.VerdictOperatorAction:
+		return "Tell the spoke owner what to do: " + delegatedPlanPlain(strings.TrimPrefix(strings.TrimSpace(d.Text), "operator action — ")) + ".",
+			[]string{"Hive posts that to the spoke owner and labels " + ref + " needs-owner; no agent is sent.", ref + " stays where it is and clears once the report stops recurring."}
+	case d.Verdict == delegatedecision.VerdictNotNow:
+		return "Decline " + ref + " for now and close it as not planned.",
+			[]string{"Hive posts why: no incident or recurrence justifies the cost yet.", ref + " is closed as not planned; re-propose it with evidence."}
 	default:
 		text := delegatedPlanPlain(d.Text)
 		if text == "" {
