@@ -3247,6 +3247,13 @@
     .spark-row { display: flex; align-items: center; gap: var(--sp-3); overflow: hidden; }
 
     .contributors-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(500px,100%),1fr)); gap:var(--sp-5); }
+    /* Contributors header pill and card presence dot: "online" is the
+       tracker's presence window (governor.labels.stage.presence_window). */
+    .contrib-status-badge { font-size: 0.7rem; padding: var(--sp-1) var(--sp-4); border-radius: var(--r-pill); margin-left: var(--sp-4); background: var(--line); color: var(--fg); }
+    .contrib-status-badge:empty { display: none; }
+    .contrib-status-badge.is-online { background: var(--status-ok); color: var(--bg); }
+    .contrib-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--status-neutral); }
+    .contrib-status-dot.online { background: var(--status-ok); }
     .contrib-card {
       --contrib-accent: #5aa7ff;
       --contrib-accent-2: #74df9a;
@@ -7133,7 +7140,7 @@
     <div class="oc-nav-group">
       <div class="oc-nav-label">Resources</div>
       <a class="oc-nav-item" data-section="repos-section" data-action="ocNavigate" data-arg0="repos-section"><span class="oc-nav-emoji">📦</span><span class="oc-nav-text">Projects</span><span id="repos-sidebar-badge" class="badge-count oc-nav-count" data-zero>0</span></a>
-      <a class="oc-nav-item" data-section="contributors-section" data-action="ocNavigate" data-arg0="contributors-section"><span class="oc-nav-emoji">👥</span><span class="oc-nav-text">Contributors</span><span id="contributors-sidebar-badge" class="badge-count oc-nav-count" data-zero>0</span></a>
+      <a class="oc-nav-item" data-section="contributors-section" data-action="ocNavigate" data-arg0="contributors-section"><span class="oc-nav-emoji">👥</span><span class="oc-nav-text">Contributors</span><span id="contributors-sidebar-badge" class="badge-count oc-nav-count" data-zero hidden>0/0</span></a>
     </div>
     <div class="oc-nav-group">
       <div class="oc-nav-label">Intelligence</div>
@@ -7566,7 +7573,7 @@
     <div style="display:flex;align-items:center;gap:var(--sp-5);margin-bottom:var(--sp-5);flex-wrap:wrap" class="section-header-toggle" data-action="toggleSection" data-arg0="contributors-section">
       <button type="button" class="dashboard-grip" data-dashboard-grip data-stop="1" aria-label="Move Contributors section" aria-pressed="false">⠿</button>
       <span class="section-chevron">▼</span>
-      <h2 class="section-label m-0">👥 Contributors <span id="contributors-status-badge" style="font-size:0.7rem;padding:var(--sp-1) var(--sp-4);border-radius:var(--r-pill);margin-left:var(--sp-4)"></span></h2>
+      <h2 class="section-label m-0">👥 Contributors <span id="contributors-status-badge" class="contrib-status-badge" title="0 online · 0 registered"></span></h2>
       <a href="/contribute" target="_blank" data-action="gh3" style="font-size:var(--fs-sm);padding:var(--sp-2) var(--sp-5);background:var(--green);color:var(--bg);border-radius:var(--r);text-decoration:none;font-weight:600">Share /contribute link &rarr;</a>
       <a href="/leaderboard" target="_blank" data-action="gh3" style="font-size:var(--fs-sm);padding:var(--sp-2) var(--sp-5);background:transparent;color:var(--blue);border:1px solid var(--blue);border-radius:var(--r);text-decoration:none">🏆 Leaderboard</a>
     </div>
@@ -8836,7 +8843,7 @@
       'nous-section': { title: '🧪 Experiment Lab (nous)', summary: '—', settingsHtml: sectionSettingsGear('Experiment Lab', 'openNousConfig', 'Experiment Lab Configuration') },
       'inception-section': { title: '💡 Inception (spektacular)', summary: 'ready', badgeHtml: '<a class="dash-card-badge" href="https://github.com/jumppad-labs/spektacular" target="_blank" rel="noopener noreferrer" data-stop="1" title="Spektacular project">⚡ Powered by Spektacular</a>' },
       'knowledge-section': { title: '📚 Knowledge', summary: '0 facts' },
-      'contributors-section': { title: '👥 Contributors', summary: '0 active / 0 registered' },
+      'contributors-section': { title: '👥 Contributors', summary: '0 online / 0 registered' },
       'debug-section': { title: '🩺 Diagnostics', summary: 'health' },
       'logs-section': { title: '📋 Agent Logs', summary: 'logs' },
       'agents-section': { title: '🤖 Agents', summary: '0 running / 0 total' },
@@ -10006,12 +10013,12 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
     }
     function contributorsSectionSummary(contributors, pool) {
       contributors = Array.isArray(contributors) ? contributors : [];
-      const active = contributors.filter(c => c && c.active).length || Number(pool && pool.active) || 0;
+      const online = pool && pool.online != null ? (Number(pool.online) || 0) : contributors.filter(c => c && c.online).length;
       const total = contributors.length || Number(pool && pool.registered) || 0;
       const ranked = contributors.slice().sort((a, b) => (Number(b.total_tasks_completed || b.tasks_completed) || 0) - (Number(a.total_tasks_completed || a.tasks_completed) || 0));
       const top = ranked[0] && (ranked[0].github_username || ranked[0].login);
-      if (top) return `${total} contributors · ${active} active · top: @${top}`;
-      return total ? `${total} contributors · ${active} active` : '0 contributors';
+      if (top) return `${total} contributors · ${online} online · top: @${top}`;
+      return total ? `${total} contributors · ${online} online` : '0 contributors';
     }
     function inceptionSectionSummary() {
       const campaigns = Array.isArray(_campaigns) ? _campaigns : [];
@@ -15735,10 +15742,22 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       const a = item && item.kind === 'pr' ? item.adoption : null;
       return !!(a && a.due && a.action === 'decide:adopt');
     }
-    // The chip text: "adopt?" when the owner is asked, else "waiting on @x".
+    // Whether an Adopt now is queued on the row (`adoption.queued_by` /
+    // `takeover.forced_by`): the operator already acted; the sweep has not
+    // opened the copy yet. The row reads as acted on and offers no Adopt.
+    const STAGE_TRACKER_ADOPTION_QUEUED_CHIP = 'adopting… (queued)';
+    function stageTrackerAdoptionQueued(item) {
+      const a = item && item.kind === 'pr' ? item.adoption : null;
+      const tk = item && item.kind === 'pr' ? item.takeover : null;
+      return !!((a && a.queued_by) || (tk && tk.forced_by));
+    }
+    // The chip text: "adopt?" when the owner is asked, "adopting… (queued)"
+    // once Adopt now was pressed, else "waiting on @x".
     function stageTrackerAdoptionChipText(item) {
       const a = item && item.adoption;
       if (!a) return '';
+      // Guarded: the test harnesses load helpers by name.
+      if (typeof stageTrackerAdoptionQueued === 'function' && stageTrackerAdoptionQueued(item)) return STAGE_TRACKER_ADOPTION_QUEUED_CHIP;
       if (stageTrackerAdoptOffered(item)) return 'adopt?';
       if (a.blocked_by) return 'not adopted';
       // Guarded: the test harnesses load helpers by name.
@@ -15869,11 +15888,14 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
     }
     // The waiting-on pill for a row with presence but no adoption line (071
     // Needs author, 072 before the first nudge, a human's PR): "waiting on
-    // [person] @zoe" — the glyph says who, the title says the rest.
+    // [person] @zoe" — the glyph says who, the title says the rest. A
+    // person's own PR reads "waiting on @zoe to push": the hive waits for
+    // their commit, it is not asking anyone to close it.
     function stageTrackerPresenceChipText(item) {
       const p = stageTrackerPresenceOf(item);
       if (!p) return '';
-      const text = 'waiting on @' + p.login;
+      const ownPR = item && item.kind === 'pr' && item.author_kind === 'human' && p.kind === 'human' && String(item.author || '').toLowerCase() === String(p.login).toLowerCase();
+      const text = 'waiting on @' + p.login + (ownPR ? ' to push' : '');
       // Guarded: the test harnesses load helpers by name.
       return typeof stageTrackerReworkSuffix === 'function' ? stageTrackerReworkSuffix(text, item) : text;
     }
@@ -15983,14 +16005,16 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       ctx = ctx || {};
       const write = ctx.canHold !== false && !!ctx.user;
       const whyWrite = write ? '' : STAGE_TRACKER_WHY_WRITE;
-      const adoptOk = write && !!tk.adopt_now;
+      const adoptOk = write && !!tk.adopt_now && !tk.forced_by;
       const adoptWhy = adoptOk ? '' : (whyWrite || tk.adopt_now_reason || 'Not available on this row');
       const rerouteOk = write && !!tk.reroute;
       const rerouteWhy = rerouteOk ? '' : (whyWrite || tk.reroute_reason || 'Not available on this row');
-      return [
-        { id: 'decide:adopt-now', label: STAGE_TRACKER_ACTION_LABELS['decide:adopt-now'] + '…', note: STAGE_TRACKER_ADOPT_NOW_CONSEQUENCE, enabled: adoptOk, why: adoptWhy, danger: true },
-        { id: 'decide:reroute', label: STAGE_TRACKER_ACTION_LABELS['decide:reroute'], note: tk.rerouted && tk.rerouted.to ? 'rerouted → @' + tk.rerouted.to + ' already; pick again to move it' : (rerouteOk ? 'hands the reviewer\'s requested changes to another online clanker' : ''), enabled: rerouteOk, why: rerouteWhy, submenu: stageTrackerRerouteOptions(tk, rerouteOk, rerouteWhy, nowMs) },
-      ];
+      const out = [];
+      // Adopt now is spent once pressed: the row shows "adopting… (queued)"
+      // instead of offering the same action again (hivecommons/hive#15038).
+      if (!tk.forced_by) out.push({ id: 'decide:adopt-now', label: STAGE_TRACKER_ACTION_LABELS['decide:adopt-now'] + '…', note: STAGE_TRACKER_ADOPT_NOW_CONSEQUENCE, enabled: adoptOk, why: adoptWhy, danger: true });
+      out.push({ id: 'decide:reroute', label: STAGE_TRACKER_ACTION_LABELS['decide:reroute'], note: tk.rerouted && tk.rerouted.to ? 'rerouted → @' + tk.rerouted.to + ' already; pick again to move it' : (rerouteOk ? 'hands the reviewer\'s requested changes to another online clanker' : ''), enabled: rerouteOk, why: rerouteWhy, submenu: stageTrackerRerouteOptions(tk, rerouteOk, rerouteWhy, nowMs) });
+      return out;
     }
     // Pure: the "rerouted → @x" pill with the target's presence dot; '' when
     // the row is not rerouted.
@@ -17108,12 +17132,14 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
     // stageTrackerLeadActionHtml), computed against the viewer's own
     // permissions on the item's repo; '' where the actions module or a
     // viewer context is absent (the node harness lifts this file alone).
-    function stageTrackerLeadButtonHtml(item, nowMs) {
+    // subRows: the linked PRs drawn as sub-rows under an issue row — a lead
+    // that acts on one of them renders there, never on both rows.
+    function stageTrackerLeadButtonHtml(item, nowMs, subRows) {
       if (typeof stageTrackerLeadActionHtml !== 'function' || typeof stageTrackerActionCtx !== 'function' || !item) return '';
       const ctx = stageTrackerActionCtx(item.repo);
       if (!ctx) return '';
       ctx.nowMs = typeof nowMs === 'number' ? nowMs : Date.now();
-      return stageTrackerLeadActionHtml(item, ctx);
+      return stageTrackerLeadActionHtml(item, ctx, subRows);
     }
     // PR link, then the lineage chip (null = none), then the base pill.
     function stageTrackerPRPillsHtml(ref, lineage, baseRef) {
@@ -17348,7 +17374,7 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       const nowMs = Number(ctx.nowMs) || Date.now();
       const isIssue = item.kind === 'issue';
       const title = item.title || '';
-      let prRefs = [], shown = item, range = null, subs = '';
+      let prRefs = [], shown = item, range = null, subs = '', subRows = null;
       if (isIssue) {
         const linked = stageTrackerLinkedSorted(item, stages);
         if (linked.length === 1) {
@@ -17364,6 +17390,7 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
           range = { to: 20 };
           if (stageTrackerAnchor(item.stage, stages, item.kind) <= 20) shown = Object.assign({}, item, { stage: 40 });
           subs = linked.map(lp => stageTrackerSubRowHtml(lp, item, stages, nowMs, ctx)).join('');
+          subRows = linked;
         }
       }
       // Invariant (owner): the issue slot on the left never holds a PR. A
@@ -17409,7 +17436,7 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       return `<div class="ham-row${typeof stageTrackerCueClasses === 'function' ? stageTrackerCueClasses(shown, ctx) : ''}${typeof stageTrackerTrainRowClass === 'function' ? stageTrackerTrainRowClass(item, ctx.prevRow || null, ctx.nextRow || null, ctx.trainIndex && trainKey ? ctx.trainIndex[trainKey] : undefined) : ''}" tabindex="0" data-ham-kind="${esc(item.kind)}" data-ham-repo="${esc(item.repo || '')}" data-ham-stage="${Number(item.stage) || 0}"${prs ? ` data-ham-prs="${esc(prs)}"` : ''}${trainKey ? ` data-ham-train="${esc(trainKey)}"` : ''}>
         ${stageTrackerRowToolsHtml(item)}
         <div class="ham-row-head">
-          ${stageTrackerHeadColsHtml(prRefs, leadHtml, stageTrackerActedBadgeHtml(item, nowMs) + stageTrackerChipsHtml(shown) + (typeof stageTrackerLeadButtonHtml === 'function' ? stageTrackerLeadButtonHtml(item, nowMs) : ''))}
+          ${stageTrackerHeadColsHtml(prRefs, leadHtml, stageTrackerActedBadgeHtml(item, nowMs) + stageTrackerChipsHtml(shown) + (typeof stageTrackerLeadButtonHtml === 'function' ? stageTrackerLeadButtonHtml(item, nowMs, subRows) : ''))}
         </div>
         <div class="ham-strip-row">
           <ol class="ham-strip" aria-label="Pipeline progress"${stageTrackerMoveAttrs(stageTrackerItemKey(item), ctx)}>${stageTrackerStripItems(shown, stages, range, nowMs, ctx)}</ol>
@@ -19414,11 +19441,19 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       const server = d && Array.isArray(d.options) ? d.options : [];
       const out = [];
       for (const o of server) {
-        if (!o || !o.action || STAGE_TRACKER_GENERIC_ACTIONS.indexOf(o.action) >= 0 || o.action.indexOf('decide:') !== 0 || (taken && taken[o.action])) continue;
+        // A server-marked lead (`lead`) heads the menu even when the
+        // Decide… submenu lists the same verb generically: the row's
+        // answer is this one, with its consequence.
+        if (!o || !o.action || STAGE_TRACKER_GENERIC_ACTIONS.indexOf(o.action) >= 0 || o.action.indexOf('decide:') !== 0 || (taken && taken[o.action] && !o.lead)) continue;
         const allowed = stageTrackerActionAllowed(o.action, ctx);
         const enabled = !!o.enabled && allowed.enabled;
         const why = enabled ? '' : (o.enabled ? allowed.why : (o.reason_if_disabled || 'Not available on this row'));
-        out.push({ id: o.action, label: o.label || STAGE_TRACKER_ACTION_LABELS[o.action] || o.action, hint: o.consequence || '', enabled, why, danger: /^decide:close-/.test(o.action), lead: true, target: dec.item });
+        // A destructive option never leads the row on its own: only when
+        // the server marks it (`lead`, the reviewer named the PR that
+        // supersedes this one) does a close become the inline button. It
+        // still sits in the ⋯ menu either way.
+        const danger = /^decide:close-/.test(o.action);
+        out.push({ id: o.action, label: o.label || STAGE_TRACKER_ACTION_LABELS[o.action] || o.action, hint: o.consequence || '', enabled, why, danger, lead: !danger || !!o.lead, target: dec.item });
       }
       return out;
     }
@@ -19490,8 +19525,9 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       const lead = actions.find(a => a.lead);
       if (lead) return lead;
       const decide = actions.find(a => a.id === 'decide');
-      if (decide && Array.isArray(decide.submenu) && decide.submenu.length) {
-        const o = decide.submenu.find(x => x.enabled) || decide.submenu[0];
+      const safe = decide && Array.isArray(decide.submenu) ? decide.submenu.filter(x => x && !x.danger) : [];
+      if (safe.length) {
+        const o = safe.find(x => x.enabled) || safe[0];
         const enabled = !!decide.enabled && !!o.enabled;
         return Object.assign({}, o, { target: decide.target, enabled, why: enabled ? '' : (decide.enabled ? o.why : decide.why) });
       }
@@ -19511,12 +19547,28 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       const host = typeof window !== 'undefined' && window.location ? String(window.location.hostname || '') : '';
       if ((host === 'localhost' || host === '127.0.0.1') && typeof console !== 'undefined' && console.warn) console.warn('[tracker] ' + msg);
     }
+    // Pure: the lead the row itself renders. An issue row whose lead acts
+    // on a nested PR (stageTrackerDecisionTarget resolved to the one parked
+    // PR) renders none when that PR has its own sub-row carrying the same
+    // button — "Let hive decide" showed twice per item (hive#15320 →
+    // #15647, hive#15338 → #15648). The ⋯ menu's "Decide PR #N…" stays on
+    // the parent. subRows: the linked PRs drawn as sub-rows, or none.
+    function stageTrackerLeadActionOnRow(item, ctx, subRows) {
+      const a = stageTrackerLeadAction(item, ctx);
+      if (!a || !a.target || !Array.isArray(subRows) || !subRows.length || item.kind !== 'issue') return a;
+      const t = a.target;
+      if (t.kind !== 'pr') return a;
+      const lp = subRows.find(x => x && Number(x.number) === Number(t.number) && !x.superseded && (!x.repo || !t.repo || x.repo === t.repo));
+      if (!lp) return a;
+      const sub = typeof stageTrackerLinkedPRItem === 'function' ? stageTrackerLinkedPRItem(item, lp) : null;
+      return sub && stageTrackerLeadAction(sub, ctx) ? null : a;
+    }
     // The inline lead button for a row: a real <button> carrying the same
     // id, hint and enable/disable reason as the ⋯ menu entry it mirrors;
     // '' when the row has no lead. Click handling is delegated in
     // stageTrackerWireRowActions and runs runRowAction, the menu's path.
-    function stageTrackerLeadActionHtml(item, ctx) {
-      const a = stageTrackerLeadAction(item, ctx);
+    function stageTrackerLeadActionHtml(item, ctx, subRows) {
+      const a = stageTrackerLeadActionOnRow(item, ctx, subRows);
       if (!a) return '';
       const label = String(a.label || a.id);
       const tip = a.enabled ? String(a.hint || a.note || a.consequence || '') : String(a.why || '');
@@ -39773,15 +39825,15 @@ function burnAreaChart() {
 
       // Split into active (non-revoked) and revoked lists
       const showingRevokedFilter = _contributorFilters.has('revoked');
-      const nonRevoked = filtered.filter(c => c.trust_tier !== 'revoked');
+      const nonRevoked = contributorsOnlineFirst(filtered.filter(c => c.trust_tier !== 'revoked'));
       const revoked = filtered.filter(c => c.trust_tier === 'revoked');
 
       // --- Card grid: only non-revoked contributors ---
       let html = '';
       if (nonRevoked.length > 0) {
         const cards = nonRevoked.map(c => {
-          const dotColor = c.active ? 'var(--green)' : 'var(--muted)';
-          const dotTitle = c.active ? 'Online' : 'Offline';
+          const dotClass = c.online ? 'online' : 'offline';
+          const dotTitle = c.online ? 'Online — heartbeat within the presence window' : 'Offline — no heartbeat within the presence window';
           // The face is the profile link. The @username beside it used to be a
           // second anchor to that same profile; it stays as plain text so there
           // is one control per destination.
@@ -39800,7 +39852,7 @@ function burnAreaChart() {
           const initialTint = contribTintReadCache(login) || contribTintFallback(login);
           return `<div class="contrib-card" data-contrib-login="${esc(login)}" data-contrib-avatar="${esc(c.avatar_url || '')}" style="--contrib-accent:${esc(initialTint.accent)};--contrib-accent-2:${esc(initialTint.accent2)}">
             <div style="display:flex;align-items:center;gap:var(--sp-4);margin-bottom:var(--sp-4);flex-wrap:wrap">
-              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor};flex-shrink:0" title="${dotTitle}"></span>
+              <span class="contrib-status-dot ${dotClass}" title="${dotTitle}"></span>
               ${avatarHtml}
               <span style="font-weight:600">@${esc(c.github_username)}</span>
               <span class="contrib-role-pill" style="flex-shrink:0"${tierProv ? ` title="${esc(tierProv)}"` : ''}>${trustTierBadge(c.trust_tier)}</span>
@@ -39954,15 +40006,39 @@ function burnAreaChart() {
       const sidebarBadge = document.getElementById('contributors-sidebar-badge');
       const statusBadge = document.getElementById('contributors-status-badge');
       if (!pool) return;
-      const activeCount = pool.active || 0;
-      const totalCount = pool.registered || 0;
-      if (sidebarBadge) setSidebarCountBadge(sidebarBadge, totalCount, `${activeCount} active of ${totalCount} registered`);
+      const onlineCount = Number(pool.online) || 0;
+      const totalCount = Number(pool.registered) || 0;
+      const tip = contributorsOnlineTitle(onlineCount, totalCount, pool.presence_window);
+      // Same two-part pill as Governor / Overview: "online/total".
+      if (sidebarBadge) setSidebarPairBadge(sidebarBadge, onlineCount, totalCount, tip);
       setSectionSummary('contributors-section', contributorsSectionSummary(_cachedContributors || [], pool));
       if (statusBadge) {
-        statusBadge.textContent = `${activeCount} active / ${totalCount} registered`;
-        statusBadge.style.background = activeCount > 0 ? 'var(--green)' : 'var(--line)';
-        statusBadge.style.color = '#fff';
+        statusBadge.textContent = `${onlineCount} online / ${totalCount} registered`;
+        statusBadge.title = tip;
+        statusBadge.classList.toggle('is-online', onlineCount > 0);
       }
+    }
+
+    // contributorsOnlineTitle is the pill tooltip: "3 online · 12 registered
+    // (heartbeat within 15m)". The window is the hub's presence_window, the
+    // same one the tracker's "(offline 13m)" caption is judged against.
+    function contributorsOnlineTitle(online, total, window) {
+      const o = Number(online) || 0;
+      const t = Number(total) || 0;
+      const w = window ? ` (heartbeat within ${window})` : '';
+      return `${o} online · ${t} registered${w}`;
+    }
+
+    // contributorsOnlineFirst orders a contributor list online first, then by
+    // login, so the people who can take work now sit at the top. Pure; does
+    // not mutate its input.
+    function contributorsOnlineFirst(list) {
+      return (Array.isArray(list) ? list.slice() : []).sort((a, b) => {
+        const ao = a && a.online ? 1 : 0;
+        const bo = b && b.online ? 1 : 0;
+        if (ao !== bo) return bo - ao;
+        return String((a && a.github_username) || '').localeCompare(String((b && b.github_username) || ''));
+      });
     }
 
     // fetchContributors() + fetchLeaderboard() — deferred to _deferredInit
