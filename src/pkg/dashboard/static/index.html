@@ -2180,6 +2180,14 @@
     .sts-sample { padding: var(--sp-3) var(--sp-2) 0; }
     .sts-sample .ham-row { padding: var(--sp-2); }
     .sts-sample .ham-cols { padding-top: 0; }
+    .nq-rail { margin: var(--sp-5) 0; padding: var(--sp-5); border: 1px solid var(--border-color); border-radius: var(--r); overflow-wrap: anywhere; }
+    .nq-rail h3, .nq-rail h4, .nq-rail h5 { margin: var(--sp-4) 0; }
+    .nq-muted { color: var(--text-secondary); font-size: var(--fs-sm); }
+    .nq-scope { margin-top: var(--sp-5); border-top: 1px solid var(--border-color); }
+    .nq-candidates { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: var(--sp-5); }
+    .nq-candidate { padding: var(--sp-5); border: 1px solid var(--border-color); border-radius: var(--r-sm); min-width: 0; }
+    .nq-entries, .nq-candidate ul { padding-left: var(--sp-8); }
+    .nq-rail li { margin: var(--sp-3) 0; }
     .agent-blockers { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--sp-1) var(--sp-3); font-size: var(--fs-xs); margin-top: var(--sp-2); color: var(--muted); }
     .agent-blockers .ab-key { opacity: 0.65; margin-right: 3px; }
     .agent-blockers .ab-seg { white-space: nowrap; }
@@ -7823,6 +7831,7 @@
         <button type="button" class="ham-chip ham-queue-chip" id="activity-monitor-queue" data-action="hamQueueToggle" data-stop="1" aria-haspopup="dialog" aria-expanded="false" aria-controls="activity-monitor-queue-pop" title="Merge queue: empty" hidden>⛓ Merge queue <span class="ham-queue-n">0</span></button>
         <div class="ham-merged-pop ham-queue-pop" id="activity-monitor-queue-pop" role="dialog" aria-label="Merge queue" hidden></div>
       </div>
+      <div id="activity-monitor-native-queue" class="nq-rail" role="region" aria-label="Forge-owned merge queues" hidden></div>
       <div id="activity-monitor-preparation" class="ham-preparation" role="region" aria-label="Preparation queues" hidden></div>
       <div id="activity-monitor-panel"><div class="ham-empty">Loading the tracker…</div></div>
       <div class="ham-meta ham-meta-foot" id="activity-monitor-meta-foot"></div>
@@ -19501,6 +19510,87 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       const shown = _stageTrackerPreparationShown.get(stageTrackerPreparationKey(item.repo, p.number));
       return !!(shown && item.head === shown.head && p.head_sha === shown.head && (!p.current_head || p.current_head === shown.head) && (!item.base_ref || item.base_ref === shown.base));
     }
+    // Forge-owned queues are observations, not seats in Hive's preparation
+    // train and not pipeline rows. This module never moves or mutates items.
+    const NATIVE_QUEUE_SECOND_MS = 1000;
+    const NATIVE_QUEUE_MINUTE_S = 60;
+    function stageTrackerNativeAge(value, nowMs) {
+      const at = Date.parse(value || '');
+      if (!Number.isFinite(at) || at > nowMs) return 'age unknown';
+      return Math.floor((nowMs - at) / (NATIVE_QUEUE_SECOND_MS * NATIVE_QUEUE_MINUTE_S)) + 'm';
+    }
+
+    function stageTrackerNativeLink(url, label) {
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol === 'https:') return `<a href="${esc(parsed.href)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`;
+      } catch (_) {}
+      return esc(label);
+    }
+
+    function stageTrackerNativeIdentities(items) {
+      const result = [];
+      (items || []).forEach(item => {
+        if (!item) return;
+        if (item.kind === 'pr') result.push(item);
+        (item.linked_prs || []).forEach(pr => result.push(Object.assign({ repo: item.repo }, pr)));
+      });
+      return result;
+    }
+
+    function stageTrackerNativeMember(member, observation, all, page) {
+      const same = item => String(item.repo || '').toLowerCase() === String(observation.repo || '').toLowerCase()
+        && Number(item.number) === Number(member.pr) && item.head === member.head && item.base_ref === observation.base;
+      const where = page.some(same) ? 'on this page' : all.some(same) ? 'outside current page/filters' : 'outside tracker snapshot or head changed';
+      const repo = String(observation.repo || '');
+      const url = /^[-\w.]+\/[-\w.]+$/.test(repo) ? `https://github.com/${repo}/pull/${member.pr}` : '';
+      return `${stageTrackerNativeLink(url, '#' + member.pr)} <code title="${esc(member.head || '')}">${esc(String(member.head || '').slice(0, 12) || 'head unknown')}</code> <span class="nq-muted">${esc(where)}</span>`;
+    }
+
+    function stageTrackerNativeQueueHtml(observations, items, pageItems, nowMs, repoFilter) {
+      const all = stageTrackerNativeIdentities(items), page = stageTrackerNativeIdentities(pageItems);
+      const queues = (observations || []).filter(q => !repoFilter || !q.repo || q.repo.toLowerCase() === repoFilter.toLowerCase());
+      if (!queues.length) return '';
+      return '<h3>Forge-owned merge queues</h3><p class="nq-muted">Hive admits and repairs; the forge validates and merges. Separate from preparation/readiness and the actual pipeline rows. No ETA is inferred.</p>'
+        + queues.map(q => {
+          const observed = Date.parse(q.observed_at || '');
+          const stale = q.stale || !Number.isFinite(observed) || !q.fresh_for_s || nowMs - observed > q.fresh_for_s * NATIVE_QUEUE_SECOND_MS;
+          const entries = Array.isArray(q.entries) ? q.entries : [];
+          const candidates = Array.isArray(q.candidates) ? q.candidates : [];
+          const outcomes = Array.isArray(q.outcomes) ? q.outcomes : [];
+          const label = q.provider === 'github-native' ? 'GitHub merge queue' : String(q.provider || 'Unknown provider');
+          return `<section class="nq-scope"><h4>${esc(label)} · ${esc(q.repo || 'scope unknown')} ${esc(q.base || '')}</h4>
+            <p class="nq-muted">${esc(q.state || 'unknown')} · ${stale ? '<strong>STALE / unavailable as current evidence</strong>' : 'observed ' + esc(stageTrackerNativeAge(q.observed_at, nowMs)) + ' ago'} · ${q.complete ? 'bounded snapshot complete' : 'coverage incomplete / unknown'}.
+            ${esc(q.reason || '')} Queue references remain visible across row filters; repo filter applies here.</p>
+            <ol class="nq-entries">${entries.map(entry => `<li value="${Number(entry.position) || 1}">${stageTrackerNativeMember(entry, q, all, page)} · ${esc(entry.state || 'state unknown')} · queued ${esc(stageTrackerNativeAge(entry.enqueued_at, nowMs))}</li>`).join('')}</ol>
+            ${!entries.length ? '<p class="nq-muted">' + (q.complete && !stale ? 'No entries observed in this snapshot.' : 'Entry order unavailable; this does not prove an empty queue.') + '</p>' : ''}
+            <div class="nq-candidates">${candidates.map(candidate => {
+              const proven = candidate.membership === 'proven' && Array.isArray(candidate.members) && candidate.members.length > 0;
+              return `<article class="nq-candidate"><h5>Validation candidate <code title="${esc(candidate.sha || '')}">${esc(String(candidate.sha || '').slice(0, 12) || 'SHA unknown')}</code></h5>
+                <p class="nq-muted">${esc(candidate.ref || 'ref unknown')}<br>Base <code>${esc(candidate.base_sha || 'unknown')}</code> · tree <code>${esc(candidate.tree || 'unknown')}</code></p>
+                <p>${proven ? 'Exact member heads proven at snapshot time by event base, live chain and ancestry' : '<strong>Member mapping unknown — never inferred from FIFO</strong>'}</p>
+                ${proven ? '<ul>' + candidate.members.map(member => '<li>' + stageTrackerNativeMember(member, q, all, page) + '</li>').join('') + '</ul>' : ''}
+                <p class="nq-muted">${esc(candidate.reason || '')}</p>
+                <details><summary>Candidate required CI: ${esc(candidate.ci || 'unknown')}${candidate.checks_known ? '' : ' (required policy unavailable)'}</summary>
+                  <p class="nq-muted">Checks belong to synthetic SHA <code>${esc(candidate.sha || 'unknown')}</code>, never copied from PR heads. Passing checks alone is not a merged receipt.</p>
+                  <ul>${(candidate.checks || []).map(check => `<li>${stageTrackerNativeLink(check.url, check.name)} · ${esc(check.status || 'unknown')} ${esc(check.conclusion || '')}${check.app_id ? ' · App ' + Number(check.app_id) : ''}</li>`).join('')}</ul>
+                  ${!(candidate.checks || []).length ? '<p class="nq-muted">No required check evidence available.</p>' : ''}
+                </details></article>`;
+            }).join('')}</div>
+            ${!candidates.length ? '<p class="nq-muted">No validation candidate observed. Enqueue is not testing or merge completion.</p>' : ''}
+            ${outcomes.length ? '<details><summary>Observed lifecycle receipts</summary><ul>' + outcomes.map(outcome => `<li>${esc(outcome.kind)} ${outcome.pr ? '#' + Number(outcome.pr) : ''} <code>${esc(outcome.candidate_sha || outcome.merge_sha || outcome.head || '')}</code> · ${esc(stageTrackerNativeAge(outcome.observed_at, nowMs))} ago · ${esc(outcome.source)}</li>`).join('') + '</ul><p class="nq-muted">Removal/destroyed is not proof of failure, rebuild reason or merge. Only an observed merged receipt means merged. History is bounded and may have gaps after restart.</p></details>' : ''}
+          </section>`;
+        }).join('');
+    }
+
+    function stageTrackerNativeQueueSync(data, pageRows, nowMs, repoFilter) {
+      const root = document.getElementById('activity-monitor-native-queue');
+      if (!root) return;
+      const rows = (pageRows || []).map(row => row.item || row).filter(Boolean);
+      const html = stageTrackerNativeQueueHtml((data || {}).integration_queues || [], (data || {}).items || [], rows, nowMs, repoFilter);
+      root.hidden = !html;
+      setIfChanged(root, html);
+    }
     function stageTrackerPagerHtml(page) {
       if (page.pages <= 1) return '';
       return `<nav class="ham-pager" aria-label="Tracker pages"><button type="button" class="ham-chip" data-action="hamFilter" data-arg0="page" data-arg1="prev"${page.page <= 1 ? ' disabled' : ''} aria-label="Previous page">‹ Prev</button><span>page ${page.page} of ${page.pages}</span><button type="button" class="ham-chip" data-action="hamFilter" data-arg0="page" data-arg1="next"${page.page >= page.pages ? ' disabled' : ''} aria-label="Next page">Next ›</button></nav>`;
@@ -19566,6 +19656,7 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       const d = typeof stageTrackerMergingHoldView === 'function' ? stageTrackerMergingHoldView(_stageTracker, _stageTrackerMergingHold, nowMs) : _stageTracker;
       if (!d || d.status === 'initializing' || !Array.isArray(d.items)) {
         if (typeof stageTrackerPreparationVisualSync === 'function') stageTrackerPreparationVisualSync(null, [], [], [], nowMs);
+        if (typeof stageTrackerNativeQueueSync === 'function') stageTrackerNativeQueueSync(null, [], nowMs, '');
         stageTrackerSidebarCountsUnknown();
         setIfChanged(el, '<div class="ham-empty">Waiting for the first scan…</div>');
         return;
@@ -19595,6 +19686,7 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
         : stageTrackerPage(ordered, f);
       if (page.page !== f.page) f.page = page.page;
       if (typeof stageTrackerPreparationVisualSync === 'function') stageTrackerPreparationVisualSync(d, ordered, page.rows, stages, nowMs);
+      if (typeof stageTrackerNativeQueueSync === 'function') stageTrackerNativeQueueSync(d, page.rows, nowMs, f.repo);
       // Attention is counted over the filtered set, nested PRs included.
       const filteredAll = d.items.filter(it => stageTrackerMatches(it, f, ctx));
       const attention = filteredAll.filter(stageTrackerNeedsAttention).length;
@@ -58350,6 +58442,33 @@ function burnAreaChart() {
             <div class="config-toggle-switch ${am.require_current_base_default ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="auto-merge" data-key="require_current_base_default"></div>
             <span class="config-toggle-label">Merge only on current base ${yamlHint('auto_merge.require_current_base_default')} ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Merge only on current base', `OFF by default. Before auto-merging in any lane, require the PR head to contain the current base tip; a green head tested on an older base is updated with GitHub update-branch and merges once CI is green on the new head. Costs one compare call per merge candidate. Per-repo overrides live on the repo card.`)}</span>
           </div>
+          <div class="config-field">
+            <label>Native GitHub merge queue ${yamlHint('auto_merge.native_merge_queue')} ${settingHelpMark('native-merge-queue', 'opting-in', 'Native GitHub merge queue', `Default off. Hive controls admission and repair; GitHub tests and merges the synthetic group. Settings requires explicit repositories and exact repo#base pairs. Existing CI, trust, review, hold and attribution gates stay in force.`)}</label>
+            <div class="config-toggle">
+              <div class="config-toggle-switch ${am.native_merge_queue && am.native_merge_queue.enabled ? 'on' : ''}" data-action="toggleConfigSwitch" data-keydown-action="toggleConfigSwitch" data-keys="Enter, " data-arg-types="t,s,s" data-arg1="native-queue" data-arg2="enabled" data-prevent="1" data-section="native-queue" data-key="enabled" role="switch" tabindex="0" aria-label="Enable native GitHub merge queue" aria-checked="${am.native_merge_queue && am.native_merge_queue.enabled ? 'true' : 'false'}"></div>
+              <span class="config-toggle-label">Enable native GitHub merge queue (default OFF) ${settingHelpMark('native-merge-queue', 'pilot-rollout', 'Enable native GitHub merge queue', `Operator opt-in only after the GitHub prerequisites below. Save applies the Hive hand-off policy; it does not create queues or change branch protection. Off preserves conventional direct merge on branches without a required queue; a queue-required branch remains parked, never bypassed.`)}</span>
+            </div>
+            <label>Native queue repositories ${settingHelpMark('native-merge-queue', 'opting-in', 'Native queue repositories', `Comma-separated owner/repo allow-list. Settings refuses enabled queues with an empty list. Start with hivecommons/hive only; other repositories retain direct mode.`)}</label>
+            <input type="text" value="${esc(((am.native_merge_queue || {}).repos || []).join(', '))}" placeholder="hivecommons/hive" data-change-action="markDirtyNativeQueue" data-arg0="repos" data-arg-types="s,w">
+            <label>Native queue bases ${yamlHint('auto_merge.native_merge_queue.bases[]')} ${settingHelpMark('native-merge-queue', 'opting-in', 'Native queue bases', `Comma-separated exact owner/repo#base pairs. Repository names ignore case; branch names preserve case. No wildcards. Start with hivecommons/hive#v5. Every pair must belong to a listed repository.`)}</label>
+            <input type="text" value="${esc(((am.native_merge_queue || {}).bases || []).join(', '))}" placeholder="hivecommons/hive#v5" data-change-action="markDirtyNativeQueue" data-arg0="bases" data-arg-types="s,w">
+            <div class="config-toggle">
+              <div class="config-toggle-switch ${am.native_merge_queue && am.native_merge_queue.skip_current_base_gate ? 'on' : ''}" data-action="toggleConfigSwitch" data-keydown-action="toggleConfigSwitch" data-keys="Enter, " data-arg-types="t,s,s" data-arg1="native-queue" data-arg2="skip_current_base_gate" data-prevent="1" data-section="native-queue" data-key="skip_current_base_gate" role="switch" tabindex="0" aria-label="Native queue owns freshness" aria-checked="${am.native_merge_queue && am.native_merge_queue.skip_current_base_gate ? 'true' : 'false'}"></div>
+              <span class="config-toggle-label">Queue owns freshness (default OFF) ${settingHelpMark('native-merge-queue', 'current-base-gate', 'Queue owns freshness', `Explicitly bypasses current-base and behind refresh only for opted-in repo/base pairs with an actual GitHub queue. Leave off until merge-group CI is proven and HIVE_NATIVE_QUEUE_FRESHNESS suppresses the external branch updater for the same pairs. Other branches retain coordinated refresh.`)}</span>
+            </div>
+            <label>Native queue probe TTL ${settingHelpMark('native-merge-queue', 'api-cost', 'Native queue probe TTL', `How long GitHub queue detection is cached per repo/base. Default 30m; 0 uses that default. Enter a non-negative Go duration, for example 30m.`)}</label>
+            <input type="text" value="${esc((am.native_merge_queue || {}).probe_ttl || '30m0s')}" data-change-action="markDirtyNativeQueue" data-arg0="probe_ttl" data-arg-types="s,w">
+            <p class="config-help">Configured: <strong>${am.native_merge_queue && am.native_merge_queue.enabled ? 'enabled' : 'disabled (default)'}</strong>.
+              Repositories: ${esc(((am.native_merge_queue || {}).repos || []).join(', ') || 'all watched repositories once enabled')}.
+              Bases: ${esc(((am.native_merge_queue || {}).bases || []).join(', ') || 'all queue bases (legacy YAML only)')}.
+              Queue owns freshness: ${am.native_merge_queue && am.native_merge_queue.skip_current_base_gate ? 'explicitly opted in' : 'no (default)'}.
+              Probe TTL: ${esc((am.native_merge_queue || {}).probe_ttl || '30m0s')}.</p>
+            <p class="config-help">Owner-only: stage these controls and click Save only after the
+              <a href="https://github.com/hivecommons/hive/blob/v5/src/docs/native-merge-queue.md#pilot-rollout" target="_blank" rel="noopener noreferrer">checks and branch-rule rollout</a>.
+              Prerequisites: App installation authentication, withdrawal guards, trusted-base policy proof, equivalent required-check migration, MERGE method and a bounded pilot group.
+              Enabled here does not mean deployed or enabled in GitHub. Turning it off does not disable GitHub's queue or withdraw existing entries; drain those before rollback. Direct merge with coordinated refresh remains available; this is not Hive's visual train.
+              Integration-aware multi-agent orchestration is planned, not a selectable implementation.</p>
+          </div>
           <div class="config-toggle mt-4">
             <div class="config-toggle-switch ${rv.post_comments ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="review" data-key="post_comments"></div>
             <span class="config-toggle-label">Post review comments ${yamlHint('review.post_comments')} ${settingHelpMark('review-swarm', 'configuration', 'Post review comments', `OFF by default. Reviewers publish their verdict as a PR comment through the hive-review relay, in addition to returning it to the merge queue. Off, the verdict stays internal, which on a hive without auto-merge means nobody reads it. Turn this on so a review reaches the human who has to decide.`)}</span>
@@ -60498,8 +60617,19 @@ function burnAreaChart() {
     function toggleConfigSwitch(el, section, key) {
       if (!el || el.classList.contains('disabled') || el.dataset.disabled === 'true') return;
       const isOn = el.classList.toggle('on');
+      if (section === 'native-queue') {
+        el.setAttribute('aria-checked', String(isOn));
+        markDirtyNativeQueue(key, isOn);
+        return;
+      }
       markDirty(section, key, isOn);
       if (section === 'review' && (key === 'fan_out' || key === 'combined_perspectives')) refreshReviewerAgentSummary();
+    }
+
+    function markDirtyNativeQueue(key, value) {
+      if (key === 'repos' || key === 'bases') value = String(value).split(',').map(s => s.trim()).filter(Boolean);
+      const staged = ((_configState.dirty || {})['auto-merge'] || {}).native_merge_queue || {};
+      markDirty('auto-merge', 'native_merge_queue', Object.assign({}, staged, { [key]: value }));
     }
 
     // Review label gate (Settings → Features → Review Gate → "Only review
@@ -61951,6 +62081,7 @@ function burnAreaChart() {
               body: JSON.stringify(values)
             });
             if (!amRes.ok) throw new Error(await saveErrorMessage(amRes));
+            _configState.data.auto_merge = await amRes.json().catch(() => _configState.data.auto_merge);
           } else if (_configState.type === 'governor' && section === 'sla') {
             // sla is a TOP-LEVEL config block (Delivery SLA targets); it
             // saves through its own owner-only /api/config/sla endpoint.
